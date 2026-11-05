@@ -1,7 +1,7 @@
 {
   "name": "nyaterm-bridge",
   "version": "0.1.0",
-  "description": "Run AI commands inside NyaTerm terminal sessions, with a per-workspace allowlist over NyaTerm groups and hosts. The allowlist and the location of the NyaTerm MCP helper are edited in Settings → NyaTerm 白名单.",
+  "description": "Run AI commands inside NyaTerm terminal sessions, reusing the connections, groups and jump hosts already configured there, with a per-workspace allowlist. Commands stay visible in NyaTerm and can be recorded for audit. The allowlist and the NyaTerm MCP helper location are edited in Settings → NyaTerm 白名单.",
   "license": "MIT",
   "author": "visualcjy",
   "homepage": "https://github.com/visualcjy/nyaterm-bridge#readme",

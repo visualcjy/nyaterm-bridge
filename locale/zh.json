@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "NyaTerm 终端桥接",
-    "description": "在 NyaTerm 的真实终端会话里执行 AI 命令（可实时观察），并按工作区限制可用分组与主机。"
+    "description": "在 NyaTerm 的真实终端会话里执行 AI 命令，复用已配置的连接、分组和跳板机，并按工作区限制可用范围；命令与输出在 NyaTerm 中可见、可审计。"
   }
 }

@@ -1,13 +1,22 @@
 # nyaterm-bridge
 
-> English: run AI commands in real NyaTerm terminal sessions, gated by a per-workspace allowlist over NyaTerm groups and hosts.
+> English: run AI commands in real NyaTerm terminal sessions, reusing the connections, groups and jump hosts already configured there, gated by a per-workspace allowlist.
 
 让 AI 在 **NyaTerm 的真实终端会话**里执行命令（你能实时看到整个过程），并按**工作区**限制它可以用哪些 NyaTerm 分组和主机。
 
 这是 dsh-remote 的互补件，不是替代品：
 
 - **dsh-remote**：文件读写 / workspace 镜像 / SFTP 同步 → 继续用它。
-- **nyaterm-bridge**：命令执行 → 走 NyaTerm，可见、可批准、可观察。
+- **nyaterm-bridge**：命令执行 → 走 NyaTerm。
+
+## 为什么走 NyaTerm
+
+命令不是丢进一个临时 shell，而是落在你已经在用的 NyaTerm 里，因此能直接复用它的资产、审批和留痕能力：
+
+- **复用现成连接**：分组、跳板机、SSH / 串口 / SFTP、本地终端都是 NyaTerm 里已经配好的。AI 不用另维护一套连接配置，也不会绕开你现有的跳板链路。
+- **真实终端、可观察可批准**：命令在 NyaTerm 标签页里执行，过程和输出实时可见；NyaTerm 的 External MCP 权限模式（`confirm` / `auto` / `full_access`）决定是否需要人工批准。
+- **审计与回看**：MCP 调用会进入 NyaTerm 的审计日志；在 NyaTerm 里开启会话录制/保留后，AI 执行的每条命令和输出都留在会话记录里，事后可以查，适合复盘和审计。
+- **白名单叠加**：工作区 allowlist 决定 AI 只能碰哪些分组、主机和连接，和 NyaTerm 自己的权限模型是两层独立的闸。
 
 ## 安装
 
