@@ -9,6 +9,6 @@ description:
   zh: 在 NyaTerm 的真实终端会话里执行 AI 命令，并按工作区限制可用的分组与主机。
 # GitHub-hosted raster image (png/jpg/jpeg/webp). SVG is rejected by the list.
 icon: https://raw.githubusercontent.com/visualcjy/nyaterm-bridge/main/assets/icon-180.png
-# After publishing a prebuilt GitHub Release, uncomment this and keep the asset name
-# version-free (or pin the tag). The list prefers a tarball over a source build.
-# tarball: https://github.com/visualcjy/nyaterm-bridge/releases/latest/download/nyaterm-bridge.tgz
+# Prebuilt release asset. The asset name stays version-free so the latest/download
+# URL keeps working after the next release.
+tarball: https://github.com/visualcjy/nyaterm-bridge/releases/latest/download/nyaterm-bridge.tgz
