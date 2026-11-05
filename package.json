@@ -1,0 +1,54 @@
+{
+  "name": "nyaterm-bridge",
+  "version": "0.1.0",
+  "description": "Run AI commands inside NyaTerm terminal sessions, with a per-workspace allowlist over NyaTerm groups and hosts. The allowlist and the location of the NyaTerm MCP helper are edited in Settings → NyaTerm 白名单.",
+  "license": "MIT",
+  "author": "visualcjy",
+  "homepage": "https://github.com/visualcjy/nyaterm-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/visualcjy/nyaterm-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/visualcjy/nyaterm-bridge/issues"
+  },
+  "icon": "assets/icon.png",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "nyaterm",
+    "terminal",
+    "mcp"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./assets/icon.png"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "assets/icon.png",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  }
+}

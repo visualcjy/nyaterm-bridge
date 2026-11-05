@@ -1,0 +1,38 @@
+# nyaterm-bridge bundle patch: inserts this plugin into a profile's layer stack.
+#
+# The plugin owns its own MCP connection to the NyaTerm MCP bridge
+# (`nyaterm-mcp`), so NyaTerm's raw tools are NEVER registered on ctx.tools and
+# never appear in the model's tool list. Only the gated `nt_*` tools below are
+# visible, which is what makes the per-workspace allowlist enforceable.
+- insert:
+    - id: nyaterm-bridge
+      name: 'nyaterm-bridge'
+      config:
+        enabled: true
+        enforceAllowlist: true
+        defaultObserveOnly: false
+        # GLOBAL settings + allowlist location. It governs every workspace this
+        # Harness serves, so it deliberately lives outside any one workspace (and
+        # outside the process working directory, which changes between launches).
+        # Defaults to <home>/.dsh/nyaterm-bridge on every platform, which is also
+        # per-user — important on Windows, where each account has its own home.
+        # Set storeDir only to move it elsewhere (absolute path; `~` is not
+        # expanded). Edit it at Settings → NyaTerm 白名单, or by hand.
+        # storeDir: /home/you/.dsh/nyaterm-bridge
+        # Bridge location: leave EMPTY and let the plugin auto-detect.
+        #
+        # `resolveTransport()` walks the platform candidate list — macOS
+        # /Applications and ~/Applications, Windows %LOCALAPPDATA%\Programs and
+        # %PROGRAMFILES%, Linux /usr/bin and /usr/local/bin — then falls back to
+        # PATH, and picks the discovery document belonging to the build it found.
+        # No fixed path belongs here: a Windows install is per-user
+        # (%LOCALAPPDATA%\Programs\NyaTerm\nyaterm-mcp.exe), so a path written into
+        # a shared profile is wrong for every other user.
+        #
+        # Each user can point at their own copy in
+        #   Settings → NyaTerm 白名单 → MCP 程序位置
+        # which is stored in the store file next to this profile's allowlist
+        # (`bridgeExecutable` in $DSH_HOME/nyaterm-bridge/allowlist.json) and takes
+        # precedence over this value. Set this field only to ship a deployment-wide
+        # default; otherwise keep it `''`.
+        bridgeExecutable: ''

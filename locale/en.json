@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "NyaTerm Bridge",
+    "description": "Run AI commands in real NyaTerm terminal sessions (observable live), gated by a per-workspace allowlist over NyaTerm groups and hosts."
+  }
+}
