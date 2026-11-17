@@ -314,6 +314,7 @@ class NyaTermMcpClient {
   #child
   #bridge
   #discoveryFile
+  #server
   #pending = new Map()
   #nextId = 1
   #buffer = ''
@@ -362,8 +363,9 @@ class NyaTermMcpClient {
       this.#request('initialize', {
         protocolVersion: '2026-07-28',
         capabilities: {},
-        clientInfo: { name: 'nyaterm-bridge', version: '0.1.0' },
-      }).then(() => {
+        clientInfo: { name: 'nyaterm-bridge', version: '0.2.0' },
+      }).then((result) => {
+        this.#server = result?.serverInfo
         // The initialized notification is fire-and-forget by protocol design.
         this.#notify('notifications/initialized')
         resolve(undefined)
@@ -440,6 +442,11 @@ class NyaTermMcpClient {
     await this.#ensureReady()
     const result = await this.#request('tools/list', {})
     return Array.isArray(result?.tools) ? result.tools : []
+  }
+
+  /** `serverInfo` from the MCP handshake (name + version), once connected. */
+  serverInfo() {
+    return this.#server
   }
 
   /** Call one NyaTerm tool and return its structured and text payloads. */
@@ -830,6 +837,43 @@ function stripTerminalControls(text) {
 }
 
 /**
+ * True when a NyaTerm result exceeded its inline budget and was replaced by
+ * `{outputId, preview, totalBytes, truncated}`.
+ *
+ * NyaTerm then serves the real payload in chunks through `tool_output_read`;
+ * each chunk's `data` is the JSON text of the original result. A chunk boundary
+ * can fall inside a JSON string, so chunks must be concatenated before parsing.
+ */
+function isOutputWrapper(value) {
+  return value !== null && typeof value === 'object'
+    && typeof value.outputId === 'string' && value.outputId.length > 0
+    && !Object.hasOwn(value, 'output')
+    && !Object.hasOwn(value, 'items')
+}
+
+/** Human byte count for listings and diagnostics. */
+function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes)) return '?'
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`
+  return `${bytes} B`
+}
+
+/** ISO-8601 second precision for remote mtimes. */
+function formatMtime(seconds) {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return '-'
+  return new Date(seconds * 1000).toISOString().replace('T', ' ').slice(0, 19)
+}
+
+/** One `sftp_list` entry as a compact, aligned line. */
+function formatFsEntry(entry, index) {
+  const kind = entry.is_dir === true ? 'd' : entry.is_symlink === true ? 'l' : '-'
+  const pad = (value, width) => String(value ?? '-').padEnd(width)
+  const size = String(entry.size ?? '-').padStart(10)
+  return `${String(index).padStart(3)} ${kind} ${pad(entry.permissions, 4)} ${pad(entry.owner, 8)} ${pad(entry.group, 8)} ${size} ${formatMtime(entry.mtime)} ${entry.name ?? '?'}`
+}
+
+/**
  * Render one `terminal_execute` result for the model.
  *
  * This bridge runs the command and returns its output inline as
@@ -843,7 +887,9 @@ function describeExecResult(structured, text) {
   const output = typeof raw === 'string' ? stripTerminalControls(raw) : raw
   const notes = []
   if (structured?.timedOut === true) {
-    notes.push(`timed out${structured.durationMs === undefined ? '' : ` after ${structured.durationMs} ms`}`)
+    // NyaTerm cannot tell whether a timed-out write actually ran, so the model
+    // must not treat a retry as idempotent.
+    notes.push(`timed out${structured.durationMs === undefined ? '' : ` after ${structured.durationMs} ms`}; the command may or may not have run — do not blindly retry a mutating command, and use nt_job_start with a connectionId for long or busy targets`)
   } else if (structured?.exitCode !== undefined && structured?.exitCode !== null) {
     notes.push(`exit code ${structured.exitCode}`)
   }
@@ -1036,7 +1082,9 @@ export function apply(ctx, rawConfig) {
 
   /** Fetch the connection list and index it three ways for allowlist checks. */
   const fetchConnections = async () => {
-    const { structured, text } = await callNyaTerm('connection_list', {})
+    // A denied or broken connection_list must not read as "no saved
+    // connections": that would turn an allowlist failure into a data answer.
+    const { structured, text } = await callNyaTermStrict('connection_list', {})
     const connections = Array.isArray(structured?.connections)
       ? structured.connections
       : JSON.parse(text.length > 0 ? text : '{"connections":[]}').connections ?? []
@@ -1048,13 +1096,9 @@ export function apply(ctx, rawConfig) {
   /**
    * Sessions this plugin opened, mapped to the connection it opened them for.
    *
-   * NyaTerm's MCP surface exposes NO session -> connection link: `session_get`
-   * answers with {connected, cwd, id, name, sftpAvailable, terminalExecution,
-   * type}, and `connection_list` entries carry only {groupPath, id, name, type}.
-   * The one authoritative mapping available is the one `nt_open` creates, since
-   * it passes a connectionId in and receives that connection's sessionId back.
-   * It lives only in memory, so it dies with the plugin — {@link resolveSession}
-   * covers whatever it does not know.
+   * Kept as a fast path even though NyaTerm 2.0.x also reports
+   * `sourceConnectionId`: the plugin may run against an older bridge, and the
+   * in-memory mapping is authoritative for the tab it just opened.
    */
   const openedSessions = new Map()
 
@@ -1067,9 +1111,10 @@ export function apply(ctx, rawConfig) {
   /**
    * Resolve the connection behind a session.
    *
-   * Order: the exact mapping `nt_open` recorded, then a unique match on the
-   * session's `name` — the only link NyaTerm reports, and the only way to
-   * resolve a tab the user opened by hand. A name shared by several connections
+   * Order: the exact mapping `nt_open` recorded, then NyaTerm's own
+   * `sourceConnectionId` (present since 2.0.x, and the only exact answer for a
+   * tab the user opened by hand), then a unique match on the session's `name`
+   * for older bridges that omit the field. A name shared by several connections
    * is ambiguous and resolves to nothing, so an unverifiable session is denied
    * rather than guessed at.
    *
@@ -1078,7 +1123,13 @@ export function apply(ctx, rawConfig) {
   const resolveSession = async (sessionId, connections, byId) => {
     const opened = openedSessions.get(String(sessionId))
     if (opened !== undefined) return byId.get(opened) ?? { id: opened, name: opened, groupPath: [] }
-    const { structured } = await callNyaTerm('session_get', { sessionId })
+    const { structured } = await callNyaTermStrict('session_get', { sessionId })
+    const sourceId = structured?.sourceConnectionId
+    if (typeof sourceId === 'string' && sourceId.length > 0) {
+      // A session whose connection was deleted still yields the id, which is what
+      // the allowlist matches on; name/groupPath stay unknown until it exists.
+      return byId.get(sourceId) ?? { id: sourceId, name: String(structured?.name ?? sourceId), groupPath: [] }
+    }
     const name = structured?.name
     if (typeof name !== 'string' || name.length === 0) return undefined
     const matches = connections.filter((connection) => connection.name === name)
@@ -1132,10 +1183,14 @@ export function apply(ctx, rawConfig) {
    *
    * `session_open` only attaches: NyaTerm logs in and shows the terminal, which
    * is observation, and it is what makes a read-only grant useful (watch a
-   * device without being able to type into it). Only `terminal_execute` changes
-   * the remote side.
+   * device without being able to type into it). Execution, interruption and
+   * every SFTP mutation change the remote side.
    */
-  const operationWeight = (operation) => (operation === 'terminal_execute' ? 'write' : 'observe')
+  const WRITE_OPERATIONS = new Set([
+    'terminal_execute', 'terminal_start', 'terminal_stop',
+    'sftp_write', 'sftp_mkdir', 'sftp_rename', 'sftp_delete', 'sftp_chmod',
+  ])
+  const operationWeight = (operation) => (WRITE_OPERATIONS.has(operation) ? 'write' : 'observe')
 
   /**
    * Authorize one gated operation. Returns the resolved connection on success
@@ -1181,9 +1236,193 @@ export function apply(ctx, rawConfig) {
     const { connections, byId } = await fetchConnections()
     const connection = await resolveSession(sessionId, connections, byId)
     if (connection === undefined) {
-      throw new Error(`NyaTerm ${operation} is denied: the connection behind session ${sessionId} could not be resolved, so the allowlist cannot be checked. NyaTerm reports no connection id for a session, only its name, so a session is verifiable when nt_open opened it or when its name matches exactly one saved connection. Call nt_sessions, then open the session with nt_open.`)
+      throw new Error(`NyaTerm ${operation} is denied: the connection behind session ${sessionId} could not be resolved, so the allowlist cannot be checked. NyaTerm reports the owning connection as \`sourceConnectionId\`; a session is verifiable when nt_open opened it or when NyaTerm reports that id. Call nt_sessions, then open the session with nt_open.`)
     }
     return authorize(exec, connection, operation)
+  }
+
+  // -------------------------------------------------------------------------
+  // Result paging and owned ids
+  //
+  // `terminal_poll`, `terminal_stop` and `tool_output_read` accept only an opaque
+  // id and report neither the session nor the connection behind it. The only way
+  // to keep the allowlist enforceable is to remember which allowlisted
+  // connection each id the plugin minted belongs to, and to refuse every id it
+  // did not mint. The maps die with the plugin process, so a job from a previous
+  // run is deliberately not resumed: its target could no longer be proven.
+  // -------------------------------------------------------------------------
+
+  /** One `tool_output_read` chunk is capped by NyaTerm. */
+  const OUTPUT_CHUNK_BYTES = 65536
+  /** Unwrapping a large result stops here rather than buffering without bound. */
+  const OUTPUT_UNWRAP_BYTES = 512 * 1024
+  /** A directory listing larger than this is too big to be useful as a tool result. */
+  const FS_LIST_UNWRAP_BYTES = 1024 * 1024
+  const OWNED_ID_LIMIT = 256
+
+  const jobState = new Map()
+  const outputState = new Map()
+
+  /** Remember a job this plugin started, and whose allowlisted target it runs on. */
+  const rememberJob = (jobId, record) => {
+    if (typeof jobId !== 'string' || jobId.length === 0) return
+    jobState.set(jobId, record)
+    if (jobState.size > OWNED_ID_LIMIT) jobState.delete(jobState.keys().next().value)
+  }
+
+  /** Remember a large result this plugin handed to the model. */
+  const rememberOutput = (outputId, record) => {
+    if (typeof outputId !== 'string' || outputId.length === 0) return
+    outputState.set(outputId, record)
+    if (outputState.size > OWNED_ID_LIMIT) outputState.delete(outputState.keys().next().value)
+  }
+
+  /**
+   * Call a NyaTerm tool and turn MCP tool-level failures into errors.
+   *
+   * NyaTerm reports permission denials, write conflicts and execution failures
+   * as `isError: true` with `{code, message}` — not as JSON-RPC errors. Ignoring
+   * the flag turns a denial into a successful-looking tool result, so every call
+   * that acts on the target goes through this.
+   */
+  const callNyaTermStrict = async (tool, args) => {
+    const result = await callNyaTerm(tool, args)
+    if (result.isError === true) {
+      const code = typeof result.structured?.code === 'string' ? result.structured.code : undefined
+      const message = typeof result.structured?.message === 'string' ? result.structured.message : result.text
+      throw new Error(`NyaTerm ${tool} failed${code === undefined ? '' : ` (${code})`}: ${message.length > 0 ? message : 'no detail returned'}`)
+    }
+    return result
+  }
+
+  /**
+   * Read a wrapped result from NyaTerm in chunks until it ends or `limit` is
+   * reached.
+   *
+   * Offsets are byte offsets chosen by NyaTerm, so they are reused verbatim
+   * instead of being recomputed from the decoded string (which would drift on
+   * multi-byte characters).
+   */
+  const readWholeOutput = async (outputId, limit = OUTPUT_UNWRAP_BYTES) => {
+    let offset = 0
+    let text = ''
+    let total
+    let complete = false
+    let resume = 0
+    for (;;) {
+      const { structured } = await callNyaTermStrict('tool_output_read', {
+        outputId,
+        offset,
+        maxBytes: OUTPUT_CHUNK_BYTES,
+      })
+      const data = typeof structured?.data === 'string' ? structured.data : ''
+      if (typeof structured?.totalBytes === 'number') total = structured.totalBytes
+      text += data
+      complete = structured?.eof === true
+      const next = structured?.nextOffset
+      resume = typeof next === 'number' ? next : offset + data.length
+      // Offsets are byte offsets, so the budget is compared in the same units
+      // instead of in UTF-16 code units of the decoded text.
+      if (complete || data.length === 0 || resume >= limit) break
+      if (typeof next !== 'number' || next <= offset) break
+      offset = next
+    }
+    return { text, total, complete, resume }
+  }
+
+  /**
+   * Turn a NyaTerm result into its real payload.
+   *
+   * A result NyaTerm considered too large arrives as
+   * `{outputId, preview, totalBytes, truncated}`; the payload behind it is the
+   * original result's JSON text, so chunks are concatenated and parsed. Parsing
+   * fails when `limit` cut it short, in which case the caller gets the raw text
+   * plus the cursor to continue from with `nt_output_read`.
+   */
+  const unwrapResult = async (result, limit = OUTPUT_UNWRAP_BYTES) => {
+    if (!isOutputWrapper(result.structured)) {
+      return { structured: result.structured, text: result.text, complete: true, wrapper: false }
+    }
+    const { text, total, complete, resume } = await readWholeOutput(result.structured.outputId, limit)
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      parsed = undefined
+    }
+    return {
+      structured: parsed,
+      text,
+      total,
+      complete,
+      resume,
+      wrapper: true,
+      outputId: result.structured.outputId,
+    }
+  }
+
+  /** Re-check the allowlist for a job this plugin started. */
+  const authorizeJob = async (exec, jobId, operation) => {
+    const record = jobState.get(String(jobId))
+    if (!cfg.enforceAllowlist) return record
+    if (record === undefined) {
+      throw new Error(`NyaTerm ${operation} is denied: job "${jobId}" was not started by this plugin session, so the connection behind it cannot be checked against the allowlist. Start it with nt_job_start (jobs are not resumed across plugin restarts).`)
+    }
+    const { byId } = await fetchConnections()
+    const connection = record.connectionId === undefined ? undefined : byId.get(String(record.connectionId))
+    if (connection === undefined) {
+      throw new Error(`NyaTerm ${operation} is denied: the connection behind job "${jobId}" is no longer in NyaTerm's saved connection list, so the allowlist cannot be verified.`)
+    }
+    await authorize(exec, connection, operation)
+    return jobState.get(String(jobId))
+  }
+
+  /** Re-check the allowlist for a large result this plugin handed out. */
+  const authorizeOutput = async (exec, outputId, operation) => {
+    const record = outputState.get(String(outputId))
+    if (!cfg.enforceAllowlist) return record
+    if (record === undefined) {
+      throw new Error(`NyaTerm ${operation} is denied: output "${outputId}" was not produced through this plugin session, so its target cannot be checked against the allowlist. Ask for the content again with the tool that produced it.`)
+    }
+    const { byId } = await fetchConnections()
+    const connection = record.connectionId === undefined ? undefined : byId.get(String(record.connectionId))
+    if (connection === undefined) {
+      throw new Error(`NyaTerm ${operation} is denied: the connection behind output "${outputId}" is no longer in NyaTerm's saved connection list, so the allowlist cannot be verified.`)
+    }
+    await authorize(exec, connection, operation)
+    return record
+  }
+
+  /**
+   * Split SFTP arguments into one NyaTerm target plus the connection it names.
+   *
+   * NyaTerm's `FileTargetArgs` accepts either `sessionId` or
+   * `target: {type: 'connection', connectionId}` and never both, so the tools
+   * expose those as two optional parameters and build the wire shape here.
+   */
+  const resolveFileTarget = async (exec, args, operation) => {
+    const sessionId = typeof args.sessionId === 'string' && args.sessionId.length > 0 ? args.sessionId : undefined
+    const connectionId = typeof args.connectionId === 'string' && args.connectionId.length > 0 ? args.connectionId : undefined
+    if (sessionId !== undefined && connectionId !== undefined) {
+      throw new Error(`Pass only one of sessionId and connectionId for ${operation}: they name different targets and NyaTerm refuses both at once.`)
+    }
+    if (sessionId !== undefined) {
+      const authorized = await authorizeSession(exec, sessionId, operation)
+      return { targetArgs: { sessionId }, connection: authorized?.connection }
+    }
+    if (connectionId !== undefined) {
+      const { byId } = await fetchConnections()
+      const connection = byId.get(connectionId)
+      if (connection === undefined) {
+        throw new Error(`Unknown connectionId "${connectionId}". Call nt_connections for the saved ids (ids of deleted or renamed connections go stale).`)
+      }
+      if (String(connection.type ?? '') !== 'ssh') {
+        throw new Error(`connectionId "${connectionId}" is a ${String(connection.type ?? 'non-SSH')} connection; NyaTerm only reaches SFTP over SSH. Open it with nt_open and pass its sessionId instead.`)
+      }
+      const authorized = await authorize(exec, connection, operation)
+      return { targetArgs: { target: { type: 'connection', connectionId: String(connection.id) } }, connection: authorized?.connection ?? connection }
+    }
+    throw new Error(`Pass sessionId (an open NyaTerm session) or connectionId (a saved connection) for ${operation}: NyaTerm needs one to know which remote host to act on. Call nt_sessions or nt_connections.`)
   }
 
   // -------------------------------------------------------------------------
@@ -1257,11 +1496,11 @@ export function apply(ctx, rawConfig) {
   /** nt_sessions — list the NyaTerm sessions visible to this MCP scope. */
   register({
     name: 'nt_sessions',
-    description: 'List the NyaTerm terminal sessions currently scoped to the MCP connection, with the active and default session ids. Use it to find a sessionId for nt_exec or nt_output. Read-only.',
+    description: 'List the NyaTerm terminal sessions currently scoped to the MCP connection, with the active and default session ids, the saved connection behind each session (sourceConnectionId), and each session\'s terminal state. Use it to find a sessionId for nt_exec, nt_output or the nt_fs_* tools. Read-only.',
     parameters: NO_ARGS,
     output: textOutput((value) => value),
     async execute() {
-      const { structured, text } = await callNyaTerm('get_environment', {})
+      const { structured, text } = await callNyaTermStrict('get_environment', {})
       const payload = structured ?? (text.length > 0 ? JSON.parse(text) : {})
       const sessions = Array.isArray(payload?.sessions) ? payload.sessions : []
       const lines = [`active session: ${payload?.activeSessionId ?? '(none)'}`, `default session: ${payload?.defaultSessionId ?? '(none)'}`]
@@ -1270,7 +1509,13 @@ export function apply(ctx, rawConfig) {
         const id = session.id ?? session.sessionId ?? '(unknown)'
         const label = session.name ?? session.label ?? '(unnamed)'
         const type = session.type ?? session.protocol ?? 'ssh'
-        lines.push(`- ${label}  (sessionId=${id}, type=${type}${session.connected === false ? ', disconnected' : ''})`)
+        const state = session.terminalState ?? (session.connected === false ? 'disconnected' : 'ready')
+        // The saved connection is what the allowlist matches on; showing it lets
+        // the model pick a session whose target it knows is permitted, and lets
+        // it tell two same-named tabs apart.
+        const source = session.sourceConnectionId ?? '(unreported)'
+        const job = session.terminalJobId === undefined ? '' : `, job=${session.terminalJobId}`
+        lines.push(`- ${label}  (sessionId=${id}, type=${type}, state=${state}, connection=${source}${job})`)
       }
       return lines.join('\n')
     },
@@ -1279,9 +1524,15 @@ export function apply(ctx, rawConfig) {
   /** nt_open — open a real, visible NyaTerm tab for an allowlisted connection. */
   register({
     name: 'nt_open',
-    description: 'Open a new terminal session in NyaTerm from a saved connection and return its sessionId for nt_exec. The connection must be inside the current workspace allowlist; a read-only target may still be opened for observation — only executing on it is blocked.',
+    description: 'Open a terminal session in NyaTerm from a saved connection and return its sessionId for nt_exec. The connection must be inside the current workspace allowlist; a read-only target may still be opened for observation — only executing on it is blocked. Pass mode="reuse_or_create" to attach to an existing tab for that connection instead of always opening a new one, and idempotencyKey to make a retried open safe.',
     parameters: objectSchema({
       connectionId: { type: 'string', required: true, description: 'Exact connection id from nt_connections.' },
+      mode: {
+        type: 'string',
+        enum: ['create', 'reuse_or_create'],
+        description: 'Defaults to "create" (always a new tab). "reuse_or_create" attaches to an existing session for the connection when one exists.',
+      },
+      idempotencyKey: { type: 'string', description: 'Optional key that makes a retried open return the same result instead of opening a second tab.' },
     }),
     output: textOutput((value) => value),
     async execute(args, exec) {
@@ -1291,38 +1542,47 @@ export function apply(ctx, rawConfig) {
         throw new Error(`Unknown connectionId "${args.connectionId}". Call nt_connections for the saved ids (ids of deleted or renamed connections go stale).`)
       }
       await authorize(exec, connection, 'session_open')
-      const { structured, text } = await callNyaTerm('session_open', { connectionId: connection.id })
+      const { structured } = await callNyaTermStrict('session_open', {
+        connectionId: connection.id,
+        ...(args.mode === undefined ? {} : { mode: args.mode }),
+        ...(args.idempotencyKey === undefined ? {} : { idempotencyKey: args.idempotencyKey }),
+      })
       const sessionId = structured?.sessionId ?? structured?.session?.sessionId
       if (sessionId === undefined) {
-        return `Opened ${connection.name} in NyaTerm, but the bridge did not return a sessionId. Raw: ${text.slice(0, 500)}`
+        throw new Error(`NyaTerm session_open reported success for "${connection.name}" but returned no sessionId. Raw: ${JSON.stringify(structured)?.slice(0, 500) ?? '(none)'}`)
       }
-      // This is the only authoritative session -> connection fact NyaTerm gives
-      // us, so record it before returning: later nt_exec/nt_output calls on this
-      // session authorize against the exact connection, not a name match.
+      // The in-memory mapping is the authoritative one for the tab just opened;
+      // NyaTerm's sourceConnectionId covers every other tab.
       rememberSession(sessionId, connection.id)
-      return `Opened "${connection.name}" in NyaTerm.\nsessionId: ${sessionId}\nPass this sessionId to nt_exec; nt_output reads whatever the tab itself shows.`
+      return `Opened "${connection.name}" in NyaTerm.\nsessionId: ${sessionId}\nPass this sessionId to nt_exec, nt_job_start or the nt_fs_* tools.`
     },
   })
 
   /** nt_exec — run a command inside an allowlisted NyaTerm session. */
   register({
     name: 'nt_exec',
-    description: 'Execute a command in a NyaTerm session and return its captured output. Each call is a fresh login, so the working directory, variables and other shell state do NOT carry over — chain the steps you need into one command. Commands run non-interactively: never start something that waits on stdin (password prompt, pager, package manager without -y, ssh without -o BatchMode=yes) — it blocks until the timeout. Do not run irreversible operations (format, erase config, reboot, rm -rf) unless the user explicitly asked for them; NyaTerm applies its own approval policy, and nt_status reports whether commands are also shown in the tab. A target marked read-only in the workspace allowlist is refused here — open it and read its output instead. Pass sessionId from nt_open or nt_sessions; when omitted, NyaTerm uses its default session. A CLI network device (H3C/Huawei Comware, Cisco IOS) has no shell: send its CLI commands, and because paged output hangs until the timeout, put `screen-length disable` (Comware) on its own line first — or `terminal length 0` on IOS — in the SAME command, e.g. "screen-length disable\\ndisplay interface brief".',
+    description: 'Execute a command in an existing NyaTerm session and return its captured output. The command is typed into the session that already exists, so its working directory, exported variables and other shell state persist between calls — do not assume a fresh login, and re-establish anything you depend on. Commands run non-interactively: never start something that waits on stdin (password prompt, pager, package manager without -y, ssh without -o BatchMode=yes) — it blocks until the timeout, and a full-screen program already running in the tab makes the call time out with no output. For anything long-running, or when the tab may be busy, prefer nt_job_start with a connectionId (independent ssh_exec channel, longer timeout, pollable and interruptible). Do not run irreversible operations (format, erase config, reboot, rm -rf) unless the user explicitly asked for them; NyaTerm applies its own approval policy. A target marked read-only in the workspace allowlist is refused here — open it and read its output instead. Pass sessionId from nt_open or nt_sessions. A CLI network device (H3C/Huawei Comware, Cisco IOS) has no shell: send its CLI commands, and because paged output hangs until the timeout, put `screen-length disable` (Comware) on its own line first — or `terminal length 0` on IOS — in the SAME command, e.g. "screen-length disable\\ndisplay interface brief".',
     parameters: objectSchema({
       command: { type: 'string', required: true, description: 'Shell command to type into the session.' },
       sessionId: { type: 'string', description: 'Target NyaTerm session id. Omit to use the default session.' },
-      timeoutMs: { type: 'integer', description: 'Optional timeout in milliseconds for the command.' },
+      timeoutMs: { type: 'integer', description: 'Optional timeout in milliseconds for the command (NyaTerm caps each call at 300000).' },
+      idempotencyKey: { type: 'string', description: 'Optional key so a retried call does not run the command twice.' },
     }),
     output: textOutput((value) => value),
     async execute(args, exec) {
       const sessionId = typeof args.sessionId === 'string' && args.sessionId.length > 0 ? args.sessionId : undefined
       const run = async (target) => {
-        const { structured, text } = await callNyaTerm('terminal_execute', {
+        const result = await callNyaTermStrict('terminal_execute', {
           command: args.command,
           ...(target === undefined ? {} : { sessionId: target }),
           ...(args.timeoutMs === undefined ? {} : { timeoutMs: args.timeoutMs }),
+          ...(args.idempotencyKey === undefined ? {} : { idempotencyKey: args.idempotencyKey }),
         })
-        return describeExecResult(structured, text)
+        const unwrapped = await unwrapResult(result)
+        if (unwrapped.wrapper && unwrapped.structured === undefined) {
+          return `${stripTerminalControls(unwrapped.text)}\n[NyaTerm: the result was too large to read in full]`
+        }
+        return describeExecResult(unwrapped.structured, unwrapped.text)
       }
       if (sessionId === undefined) {
         if (!cfg.enforceAllowlist) return run(undefined)
@@ -1338,33 +1598,405 @@ export function apply(ctx, rawConfig) {
     },
   })
 
-  /** nt_output — read terminal output that no tool call has already captured. */
+  /** nt_job_start — start a long-running command as a NyaTerm job. */
   register({
-    name: 'nt_output',
-    description: 'Read terminal output from a NyaTerm session that no tool call has already captured — for example output from commands the user typed in that tab, or from a job left running there. Terminal control sequences are stripped. nt_exec already returns its own command\'s output, so this is normally empty right after nt_exec. Read-only.',
+    name: 'nt_job_start',
+    description: 'Start a command as an asynchronous NyaTerm job and return a jobId. Unlike nt_exec, the call returns immediately and the job keeps running while you poll it with nt_job_poll and interrupt it with nt_job_stop. With connectionId the command runs on NyaTerm\'s independent ssh_exec channel (no tab needed, timeout up to 86400000 ms, and a busy tab cannot break it). With sessionId it runs inside that existing session (inline_pty). Use idempotencyKey so a retry does not start the command twice. The target connection must pass the workspace allowlist; a read-only target may start no job.',
     parameters: objectSchema({
-      sessionId: { type: 'string', required: true, description: 'Target NyaTerm session id.' },
-      lines: { type: 'integer', description: 'How many trailing lines to read, when NyaTerm supports it.' },
+      command: { type: 'string', required: true, description: 'Command to run. It does not inherit an interactive shell\'s cwd or environment on the ssh_exec channel.' },
+      connectionId: { type: 'string', description: 'Saved connection to run on (ssh_exec, independent channel). Pass this or sessionId, not both.' },
+      sessionId: { type: 'string', description: 'Open session to run inside (inline_pty). Pass this or connectionId, not both.' },
+      timeoutMs: { type: 'integer', description: 'Optional job timeout in milliseconds (NyaTerm allows 1000–86400000).' },
+      idempotencyKey: { type: 'string', description: 'Optional key that makes a retried start return the same job instead of starting another.' },
     }),
     output: textOutput((value) => value),
     async execute(args, exec) {
-      await authorizeSession(exec, String(args.sessionId), 'terminal_recent_output')
-      const { structured, text } = await callNyaTerm('terminal_recent_output', {
-        sessionId: String(args.sessionId),
+      const connectionId = typeof args.connectionId === 'string' && args.connectionId.length > 0 ? args.connectionId : undefined
+      const sessionId = typeof args.sessionId === 'string' && args.sessionId.length > 0 ? args.sessionId : undefined
+      if (connectionId !== undefined && sessionId !== undefined) {
+        throw new Error('Pass only one of connectionId and sessionId to nt_job_start: they are different targets and NyaTerm refuses both at once.')
+      }
+      if (connectionId === undefined && sessionId === undefined && cfg.enforceAllowlist) {
+        // Without a target the plugin cannot prove which connection runs the
+        // job, so an enforcing workspace refuses; NyaTerm's own "default
+        // session" fallback is only reachable when the allowlist is off.
+        throw new Error('Pass connectionId (saved connection, ssh_exec) or sessionId (open session, inline_pty) to nt_job_start. One is required so the target can be checked against the allowlist.')
+      }
+      let connection
+      let payload = {}
+      if (connectionId !== undefined) {
+        const { byId } = await fetchConnections()
+        connection = byId.get(connectionId)
+        if (connection === undefined) {
+          throw new Error(`Unknown connectionId "${connectionId}". Call nt_connections for the saved ids (ids of deleted or renamed connections go stale).`)
+        }
+        if (String(connection.type ?? '') !== 'ssh') {
+          throw new Error(`connectionId "${connectionId}" is a ${String(connection.type ?? 'non-SSH')} connection, and NyaTerm only accepts a connection target over ssh_exec. Open it with nt_open and pass its sessionId instead.`)
+        }
+        const authorized = await authorize(exec, connection, 'terminal_start')
+        connection = authorized.connection ?? connection
+        payload = { target: { type: 'connection', connectionId: String(connection.id) }, backend: 'ssh_exec' }
+      } else if (sessionId !== undefined) {
+        const authorized = await authorizeSession(exec, sessionId, 'terminal_start')
+        connection = authorized?.connection
+        payload = { target: { type: 'session', sessionId: String(sessionId) }, backend: 'inline_pty' }
+      }
+      // With the allowlist off, an omitted target is passed straight through and
+      // NyaTerm starts the job in its active/default session.
+      const { structured } = await callNyaTermStrict('terminal_start', {
+        command: args.command,
+        ...payload,
+        ...(args.timeoutMs === undefined ? {} : { timeoutMs: args.timeoutMs }),
+        ...(args.idempotencyKey === undefined ? {} : { idempotencyKey: args.idempotencyKey }),
+      })
+      const jobId = structured?.jobId
+      if (typeof jobId !== 'string' || jobId.length === 0) {
+        throw new Error(`NyaTerm terminal_start returned no jobId (raw: ${JSON.stringify(structured)?.slice(0, 300) ?? '(none)'}).`)
+      }
+      const record = {
+        connectionId: connection?.id === undefined ? undefined : String(connection.id),
+        sessionId: typeof structured?.sessionId === 'string' ? structured.sessionId : sessionId,
+        backend: structured?.backend ?? payload.backend,
+        offset: 0,
+      }
+      rememberJob(jobId, record)
+      return `Started job ${jobId} (backend=${record.backend}, status=${structured?.status ?? 'unknown'}).\nPoll it with nt_job_poll jobId=${jobId}; interrupt it with nt_job_stop.`
+    },
+  })
+
+  /** nt_job_poll — read a job's incremental output and state. */
+  register({
+    name: 'nt_job_poll',
+    description: 'Read the incremental output and execution state of a job started by nt_job_start. Each call returns output produced since the previous poll (the plugin tracks the offset) plus status, processState and exitCode; eof only means this is the current output tail, not that the command finished — check status. Read-only.',
+    parameters: objectSchema({
+      jobId: { type: 'string', required: true, description: 'jobId returned by nt_job_start.' },
+      offset: { type: 'integer', description: 'Optional byte offset to read from instead of the one this plugin last returned.' },
+      maxBytes: { type: 'integer', description: 'Optional chunk size in bytes (NyaTerm caps it at 65536).' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const jobId = String(args.jobId)
+      const record = await authorizeJob(exec, jobId, 'terminal_poll')
+      const offset = args.offset === undefined ? (record?.offset ?? 0) : args.offset
+      const { structured } = await callNyaTermStrict('terminal_poll', {
+        jobId,
+        offset,
+        ...(args.maxBytes === undefined ? {} : { maxBytes: args.maxBytes }),
+      })
+      const next = typeof structured?.nextOffset === 'number' ? structured.nextOffset : offset
+      if (record !== undefined) record.offset = next
+      const output = typeof structured?.output === 'string' ? stripTerminalControls(structured.output) : ''
+      const status = structured?.status ?? 'unknown'
+      const state = structured?.processState ?? 'unknown'
+      const exit = structured?.exitCode === undefined || structured?.exitCode === null ? '-' : structured.exitCode
+      const lines = [`job ${jobId}: status=${status} process=${state} exitCode=${exit} offset=${offset}->${next} totalBytes=${formatBytes(structured?.totalBytes)}`]
+      if (structured?.sourceTruncated === true) lines.push('(NyaTerm truncated this chunk)')
+      if (structured?.droppedBeforeOffset === true) lines.push('(earlier output was dropped by NyaTerm before this offset)')
+      lines.push(output.length > 0 ? output : '(no new output since the last poll)')
+      return lines.join('\n')
+    },
+  })
+
+  /** nt_job_stop — interrupt a running job. */
+  register({
+    name: 'nt_job_stop',
+    description: 'Request one interrupt of a job started by nt_job_start. "accepted" or "sent" does not prove the remote command has exited — poll the job afterwards to confirm. A job running in an inline terminal may need manual recovery in NyaTerm. Write operation against the job\'s target.',
+    parameters: objectSchema({
+      jobId: { type: 'string', required: true, description: 'jobId returned by nt_job_start.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const jobId = String(args.jobId)
+      await authorizeJob(exec, jobId, 'terminal_stop')
+      const { structured } = await callNyaTermStrict('terminal_stop', { jobId })
+      const lines = [
+        `Stop requested for job ${jobId}: status=${structured?.status ?? 'unknown'}, stopState=${structured?.stopState ?? 'unknown'}, processState=${structured?.processState ?? 'unknown'}.`,
+        'This does not prove the command exited. Poll with nt_job_poll until status is completed, failed, cancelled or timed_out.',
+      ]
+      return lines.join('\n')
+    },
+  })
+
+  /** nt_output — read terminal output that no tool call has already captured. */
+  register({
+    name: 'nt_output',
+    description: 'Read terminal output from a NyaTerm session that no tool call has already captured — for example output from commands the user typed in that tab, or from a job left running there. Terminal control sequences are stripped. nt_exec already returns its own command\'s output, so this is normally empty right after nt_exec. When the session\'s recent buffer is larger than NyaTerm returns inline, this tool reads the page and, if it exceeds its own budget, hands back an outputId for nt_output_read. Read-only.',
+    parameters: objectSchema({
+      sessionId: { type: 'string', required: true, description: 'Target NyaTerm session id.' },
+      lines: { type: 'integer', description: 'How many trailing lines to read (NyaTerm accepts 1–500). Omit for the whole recent buffer.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const sessionId = String(args.sessionId)
+      const authorized = await authorizeSession(exec, sessionId, 'terminal_recent_output')
+      const result = await callNyaTermStrict('terminal_recent_output', {
+        sessionId,
         ...(args.lines === undefined ? {} : { lines: args.lines }),
       })
-      const raw = structured?.output ?? structured?.text ?? text
-      const output = typeof raw === 'string' ? stripTerminalControls(raw) : raw
+      const unwrapped = await unwrapResult(result)
+      const value = typeof unwrapped.structured?.output === 'string' ? unwrapped.structured.output : unwrapped.text
+      const output = stripTerminalControls(value)
+      if (unwrapped.wrapper && !unwrapped.complete && unwrapped.outputId !== undefined) {
+        // Keep the rest reachable, but only through the allowlist check.
+        if (cfg.enforceAllowlist) rememberOutput(unwrapped.outputId, { connectionId: authorized?.connection?.id })
+        return `${output}\n[NyaTerm: output truncated (${formatBytes(unwrapped.total)} total); continue with nt_output_read outputId=${unwrapped.outputId} offset=${unwrapped.resume}]`
+      }
       // The output contract is a string, and `JSON.stringify(undefined)` is
       // `undefined` — which would fail output validation instead of reporting
       // an empty read. An empty read is also worth naming: NyaTerm returns
       // `{output: ""}` rather than an error, and a bare empty result reads as a
       // broken tool.
-      if (typeof output === 'string' && output.trim().length > 0) return output
-      if (typeof output === 'string') {
-        return `(no uncaptured output for session ${args.sessionId}: NyaTerm reports nothing new since the last read. A command run through nt_exec returns its own output; this call only sees output that no tool call captured.)`
+      if (output.trim().length > 0) return output
+      return `(no uncaptured output for session ${args.sessionId}: NyaTerm reports nothing new since the last read. A command run through nt_exec returns its own output; this call only sees output that no tool call captured.)`
+    },
+  })
+
+  /** nt_output_read — page through a large result NyaTerm wrapped. */
+  register({
+    name: 'nt_output_read',
+    description: 'Read another chunk of a large NyaTerm result that this plugin handed back as an outputId. NyaTerm replaces oversized results with a page marker; nt_output and the nt_fs_* tools read what they need and return an outputId only when more remains. data is the raw result text sliced at byte offsets chosen by NyaTerm. Read-only.',
+    parameters: objectSchema({
+      outputId: { type: 'string', required: true, description: 'outputId printed by a previous result.' },
+      offset: { type: 'integer', required: true, description: 'Byte offset to start at (use the offset printed by the previous call).' },
+      maxBytes: { type: 'integer', description: 'Chunk size in bytes (NyaTerm caps it at 65536).' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      await authorizeOutput(exec, String(args.outputId), 'output_read')
+      const { structured } = await callNyaTermStrict('tool_output_read', {
+        outputId: String(args.outputId),
+        offset: args.offset,
+        ...(args.maxBytes === undefined ? {} : { maxBytes: args.maxBytes }),
+      })
+      const data = typeof structured?.data === 'string' ? structured.data : ''
+      const next = typeof structured?.nextOffset === 'number' ? structured.nextOffset : args.offset + data.length
+      const eof = structured?.eof === true
+      const hint = eof
+        ? 'end of this result'
+        : `continue with offset=${next}`
+      return `${data}\n[NyaTerm: offset ${args.offset}->${next} of ${formatBytes(structured?.totalBytes)}; ${hint}]`
+    },
+  })
+
+  // -------------------------------------------------------------------------
+  // SFTP: remote file operations on an allowlisted target
+  //
+  // Every tool takes either `sessionId` (an open, already-authorized session) or
+  // `connectionId` (a saved connection, which NyaTerm reaches over an
+  // independent ssh_exec channel and therefore needs no open tab).
+  // -------------------------------------------------------------------------
+
+  /** nt_fs_home — remote home directory. */
+  register({
+    name: 'nt_fs_home',
+    description: 'Return the remote home directory of a NyaTerm target — an open session (sessionId) or a saved SSH connection (connectionId). Read-only.',
+    parameters: objectSchema({
+      sessionId: { type: 'string', description: 'Open NyaTerm session id. Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection id. Pass this or sessionId.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const { targetArgs } = await resolveFileTarget(exec, args, 'sftp_read')
+      const { structured } = await callNyaTermStrict('sftp_home', targetArgs)
+      return `Remote home: ${structured?.path ?? '(unknown)'}`
+    },
+  })
+
+  /** nt_fs_list — list a remote directory. */
+  register({
+    name: 'nt_fs_list',
+    description: 'List a remote directory over SFTP on an allowlisted target. Entries carry type, permissions, owner, group, size and mtime. Very large directories are read up to a 1 MiB budget; use a narrower path if a listing is truncated. Read-only.',
+    parameters: objectSchema({
+      path: { type: 'string', required: true, description: 'Remote directory path, e.g. /etc/nginx.' },
+      sessionId: { type: 'string', description: 'Open NyaTerm session id. Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection id. Pass this or sessionId.' },
+      limit: { type: 'integer', description: 'Maximum entries to render (default 200, max 1000).' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const { targetArgs } = await resolveFileTarget(exec, args, 'sftp_read')
+      const result = await callNyaTermStrict('sftp_list', { path: String(args.path), ...targetArgs })
+      const unwrapped = await unwrapResult(result, FS_LIST_UNWRAP_BYTES)
+      const items = Array.isArray(unwrapped.structured)
+        ? unwrapped.structured
+        : Array.isArray(unwrapped.structured?.items) ? unwrapped.structured.items : undefined
+      if (items === undefined) {
+        throw new Error(`NyaTerm sftp_list returned a listing this plugin could not read${unwrapped.total === undefined ? '' : ` (${formatBytes(unwrapped.total)})`}. List a narrower path.`)
       }
-      return JSON.stringify(output) ?? String(output ?? '')
+      const limit = Math.min(Math.max(Number.isInteger(args.limit) ? args.limit : 200, 1), 1000)
+      const shown = items.slice(0, limit)
+      const header = items.length > shown.length
+        ? `${args.path} (${items.length} entries, first ${shown.length} shown):`
+        : `${args.path} (${items.length} entries):`
+      return [header, ...shown.map((entry, index) => formatFsEntry(entry, index + 1))].join('\n')
+    },
+  })
+
+  /** nt_fs_stat — remote path metadata. */
+  register({
+    name: 'nt_fs_stat',
+    description: 'Read metadata of one remote path over SFTP: whether it is a directory or symlink, size, permissions, owner/group, mtime and atime. Read-only.',
+    parameters: objectSchema({
+      path: { type: 'string', required: true, description: 'Remote path to stat.' },
+      sessionId: { type: 'string', description: 'Open NyaTerm session id. Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection id. Pass this or sessionId.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const { targetArgs } = await resolveFileTarget(exec, args, 'sftp_read')
+      const { structured } = await callNyaTermStrict('sftp_stat', { path: String(args.path), ...targetArgs })
+      const kind = structured?.is_dir === true ? 'directory' : structured?.is_symlink === true ? 'symlink' : 'file'
+      const lines = [
+        `${args.path}: ${kind}, ${formatBytes(structured?.size)}, ${structured?.permissions ?? '?'} ${structured?.owner ?? '?'}/${structured?.group ?? '?'}`,
+        `mtime ${formatMtime(structured?.mtime)}, atime ${formatMtime(structured?.atime)}`,
+      ]
+      if (structured?.symlink_target !== undefined && structured.symlink_target !== null) lines.push(`symlink target: ${structured.symlink_target}`)
+      return lines.join('\n')
+    },
+  })
+
+  /** nt_fs_read — read a remote text file. */
+  register({
+    name: 'nt_fs_read',
+    description: 'Read a remote UTF-8 text file over SFTP. NyaTerm refuses a file larger than maxBytes instead of truncating it, so raise maxBytes (up to 65536) or read it in shell with head/tail for bigger files. The result ends with a metadata line for the file\'s size, hash and mtime — pass those to nt_fs_write as expectedSize/expectedHash/expectedMtime to avoid overwriting a file that changed meanwhile. Read-only.',
+    parameters: objectSchema({
+      path: { type: 'string', required: true, description: 'Remote file path.' },
+      maxBytes: { type: 'integer', description: 'Maximum file size to accept, in bytes (default and cap 65536).' },
+      sessionId: { type: 'string', description: 'Open NyaTerm session id. Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection id. Pass this or sessionId.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      if (args.maxBytes !== undefined && (args.maxBytes < 1 || args.maxBytes > 65536)) {
+        throw new Error('maxBytes must be between 1 and 65536: NyaTerm reads a remote text file in one piece and refuses to truncate it.')
+      }
+      const { targetArgs } = await resolveFileTarget(exec, args, 'sftp_read')
+      const result = await callNyaTermStrict('sftp_read_text', {
+        path: String(args.path),
+        ...(args.maxBytes === undefined ? {} : { maxBytes: args.maxBytes }),
+        ...targetArgs,
+      })
+      const unwrapped = await unwrapResult(result)
+      const content = typeof unwrapped.structured?.content === 'string' ? unwrapped.structured.content : unwrapped.text
+      const meta = unwrapped.structured
+      const footer = meta === undefined
+        ? '[NyaTerm metadata unavailable]'
+        : `[NyaTerm metadata, not part of the file: ${formatBytes(meta.size)}, mtime ${formatMtime(meta.mtime)}, contentHash=${meta.contentHash ?? '?'}]`
+      return `${content.length > 0 ? content : '(empty file)'}\n${footer}`
+    },
+  })
+
+  /** nt_fs_write — write a remote text file with optional conflict protection. */
+  register({
+    name: 'nt_fs_write',
+    description: 'Write a remote UTF-8 text file over SFTP (max 1 MiB). Pass expectedHash, expectedMtime or expectedSize to make the write conditional: NyaTerm refuses it when the file changed meanwhile, which prevents clobbering concurrent edits. force=true overwrites unconditionally. NyaTerm keeps a backup when it has to replace an existing file and reports its path. Write operation.',
+    parameters: objectSchema({
+      path: { type: 'string', required: true, description: 'Remote file path.' },
+      content: { type: 'string', required: true, description: 'Full new file content (NyaTerm caps it at 1 MiB).' },
+      expectedHash: { type: 'string', description: 'Optional SHA-256 hex of the file as you last read it.' },
+      expectedMtime: { type: 'integer', description: 'Optional mtime (epoch seconds) the file had when you read it.' },
+      expectedSize: { type: 'integer', description: 'Optional size in bytes the file had when you read it.' },
+      force: { type: 'boolean', description: 'Overwrite even if the file exists and the guards do not match.' },
+      sessionId: { type: 'string', description: 'Open NyaTerm session id. Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection id. Pass this or sessionId.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const { targetArgs } = await resolveFileTarget(exec, args, 'sftp_write')
+      const { structured } = await callNyaTermStrict('sftp_write_text', {
+        path: String(args.path),
+        content: String(args.content),
+        ...(args.expectedHash === undefined ? {} : { expectedHash: args.expectedHash }),
+        ...(args.expectedMtime === undefined ? {} : { expectedMtime: args.expectedMtime }),
+        ...(args.expectedSize === undefined ? {} : { expectedSize: args.expectedSize }),
+        ...(args.force === undefined ? {} : { force: args.force }),
+        ...targetArgs,
+      })
+      const backup = typeof structured?.backupPath === 'string' && structured.backupPath.length > 0 ? `, backup ${structured.backupPath}` : ''
+      return `Wrote ${args.path}: ${structured?.status ?? 'saved'}, ${formatBytes(structured?.size)}, mtime ${formatMtime(structured?.mtime)}${backup}.`
+    },
+  })
+
+  /** nt_fs_mkdir — create a remote directory. */
+  register({
+    name: 'nt_fs_mkdir',
+    description: 'Create a remote directory over SFTP, optionally with an explicit mode such as "0755". Write operation.',
+    parameters: objectSchema({
+      path: { type: 'string', required: true, description: 'Remote directory path to create.' },
+      mode: { type: 'string', description: 'Optional octal mode, e.g. "0755".' },
+      sessionId: { type: 'string', description: 'Open NyaTerm session id. Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection id. Pass this or sessionId.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const { targetArgs } = await resolveFileTarget(exec, args, 'sftp_mkdir')
+      const { structured } = await callNyaTermStrict('sftp_mkdir', {
+        path: String(args.path),
+        ...(args.mode === undefined ? {} : { mode: args.mode }),
+        ...targetArgs,
+      })
+      return structured?.created === false ? `${args.path} already existed.` : `Created ${args.path}.`
+    },
+  })
+
+  /** nt_fs_rename — rename or move a remote path. */
+  register({
+    name: 'nt_fs_rename',
+    description: 'Rename or move a remote path over SFTP. Write operation.',
+    parameters: objectSchema({
+      oldPath: { type: 'string', required: true, description: 'Existing remote path.' },
+      newPath: { type: 'string', required: true, description: 'New remote path.' },
+      sessionId: { type: 'string', description: 'Open NyaTerm session id. Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection id. Pass this or sessionId.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const { targetArgs } = await resolveFileTarget(exec, args, 'sftp_rename')
+      const { structured } = await callNyaTermStrict('sftp_rename', {
+        oldPath: String(args.oldPath),
+        newPath: String(args.newPath),
+        ...targetArgs,
+      })
+      return structured?.renamed === false ? `Renamed nothing: ${args.oldPath} -> ${args.newPath}.` : `Renamed ${args.oldPath} -> ${args.newPath}.`
+    },
+  })
+
+  /** nt_fs_delete — delete a remote path. */
+  register({
+    name: 'nt_fs_delete',
+    description: 'Delete a remote file or directory over SFTP using NyaTerm\'s delete semantics. Deletion is irreversible, so confirm=true is required and the workspace allowlist must grant write access. Write operation.',
+    parameters: objectSchema({
+      path: { type: 'string', required: true, description: 'Remote path to delete.' },
+      confirm: { type: 'boolean', required: true, description: 'Must be true. Deletion cannot be undone.' },
+      sessionId: { type: 'string', description: 'Open NyaTerm session id. Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection id. Pass this or sessionId.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      if (args.confirm !== true) {
+        throw new Error('nt_fs_delete requires confirm=true: deletion is irreversible. Re-call with confirm=true only when the user asked for this exact deletion.')
+      }
+      const { targetArgs } = await resolveFileTarget(exec, args, 'sftp_delete')
+      const { structured } = await callNyaTermStrict('sftp_delete', { path: String(args.path), ...targetArgs })
+      return structured?.deleted === false ? `Nothing was deleted at ${args.path}.` : `Deleted ${args.path}.`
+    },
+  })
+
+  /** nt_fs_chmod — change remote permissions. */
+  register({
+    name: 'nt_fs_chmod',
+    description: 'Change permissions of a remote path over SFTP. Write operation.',
+    parameters: objectSchema({
+      path: { type: 'string', required: true, description: 'Remote path.' },
+      mode: { type: 'string', required: true, description: 'New octal mode, e.g. "0644".' },
+      sessionId: { type: 'string', description: 'Open NyaTerm session id. Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection id. Pass this or sessionId.' },
+    }),
+    output: textOutput((value) => value),
+    async execute(args, exec) {
+      const { targetArgs } = await resolveFileTarget(exec, args, 'sftp_chmod')
+      const { structured } = await callNyaTermStrict('sftp_chmod', { path: String(args.path), mode: String(args.mode), ...targetArgs })
+      return structured?.changed === false ? `Permissions of ${args.path} were unchanged.` : `Changed permissions of ${args.path} to ${args.mode}.`
     },
   })
 
@@ -1400,26 +2032,40 @@ export function apply(ctx, rawConfig) {
         lines.push(`endpoint: ${document.host}:${document.port}`)
         const mode = document.permissionMode
         lines.push(`permission mode: ${String(mode ?? '(unreported)')}`)
-        // Whether NyaTerm also shows a command in the tab is the bridge's call,
-        // not this plugin's: its own audit records `insertedToTerminal`. Observed
-        // on NyaTerm Preview, with a fresh MCP client, in BOTH "auto" and
-        // "full_access": terminal_execute returned the command's output while the
-        // audit recorded insertedToTerminal: false, so nothing appeared in the
-        // tab and each call ran in a fresh shell. The only records seen with
-        // insertedToTerminal: true come from NyaTerm's own native agent.
+        // Observed on NyaTerm 2.0.x: the session reports
+        // terminalExecution "send_only", the command is typed into the existing
+        // tab, and shell state (cwd, exported variables) persists between calls.
+        // Whether NyaTerm's audit records the insertion is NyaTerm's call; this
+        // plugin no longer claims the command is hidden from the tab.
         if (mode === 'auto' || mode === 'full_access') {
-          lines.push('command visibility: NyaTerm runs MCP commands out-of-band in this mode — the command is not shown in the tab (its audit log records insertedToTerminal: false). NyaTerm\'s own AI inserts commands into the tab; an MCP client appears to have no mode that does.')
+          lines.push('command visibility: NyaTerm runs MCP commands inside the target session (each call is audited). On 2.0.x the session is send_only: the command goes into the existing tab and its cwd/env persist between calls.')
         } else if (mode === 'observer') {
           lines.push('command visibility: "observer" denies command execution to MCP clients — only reads work.')
         } else if (mode === 'confirm') {
-          lines.push('command visibility: NyaTerm asks you to approve each command; note that its MCP path did not insert commands into the tab in the modes observed.')
+          lines.push('command visibility: NyaTerm asks you to approve each command before it runs.')
         }
       } catch (error) {
         lines.push(`discovery unreadable: ${String(error?.message ?? error)}`)
       }
       try {
-        const tools = await connect().then((active) => active.listTools())
+        const active = await connect()
+        const tools = await active.listTools()
+        const server = active.serverInfo()
+        lines.push(`bridge version: ${server?.name ?? 'nyaterm-mcp'} ${server?.version ?? '(unknown)'}`)
         lines.push(`tools: ${tools.map((tool) => tool.name).join(', ')}`)
+        const names = new Set(tools.map((tool) => tool.name))
+        const required = ['connection_list', 'get_environment', 'session_open', 'session_get', 'terminal_execute', 'terminal_recent_output']
+        const missingRequired = required.filter((name) => !names.has(name))
+        if (missingRequired.length > 0) {
+          lines.push(`bridge check: NyaTerm no longer advertises ${missingRequired.join(', ')} — this plugin cannot work against that build`)
+        }
+        // Advertised capabilities differ between NyaTerm releases; say which
+        // nt_* tools will fail instead of letting the model discover it.
+        const optional = ['terminal_start', 'terminal_poll', 'terminal_stop', 'sftp_home', 'sftp_list', 'sftp_stat', 'sftp_read_text', 'sftp_write_text', 'sftp_mkdir', 'sftp_rename', 'sftp_delete', 'sftp_chmod', 'tool_output_read']
+        const missingOptional = optional.filter((name) => !names.has(name))
+        if (missingOptional.length > 0) {
+          lines.push(`optional tools unavailable on this bridge (nt_job_*, nt_fs_*, nt_output_read need them; upgrade NyaTerm): ${missingOptional.join(', ')}`)
+        }
         lines.push('status: connected')
       } catch (error) {
         lines.push(`status: connection failed — ${String(error?.message ?? error)}`)
@@ -1432,6 +2078,12 @@ export function apply(ctx, rawConfig) {
   // Backstop guard: monotonic denial for the same rules, plus observe-only
   // workspaces that must not call unrelated tools.
   // -------------------------------------------------------------------------
+
+  /** nt_* tools that change the remote side; the guard can deny these on its own. */
+  const NT_WRITE_TOOLS = new Set([
+    'nt_exec', 'nt_job_start', 'nt_job_stop',
+    'nt_fs_write', 'nt_fs_mkdir', 'nt_fs_rename', 'nt_fs_delete', 'nt_fs_chmod',
+  ])
 
   ctx.tools.guard((exec) => {
     const toolName = String(exec?.name ?? '')
@@ -1450,7 +2102,7 @@ export function apply(ctx, rawConfig) {
     // read-only target is exactly what they are for), so a guard denial here
     // would contradict the grant.
     if (toolName === 'nt_connections' || toolName === 'nt_sessions' || toolName === 'nt_status'
-      || toolName === 'nt_workspace' || toolName === 'nt_output') {
+      || toolName === 'nt_workspace' || toolName === 'nt_output' || toolName === 'nt_output_read') {
       return undefined
     }
     const cwd = sessionCwd(exec)
@@ -1459,10 +2111,11 @@ export function apply(ctx, rawConfig) {
     if (entry.unconfigured && !cfg.defaultObserveOnly) {
       return `NyaTerm ${toolName} is denied: workspace "${cwd ?? '(unknown)'}" is not listed in the allowlist (${storeFile}).`
     }
-    // An observe-only workspace makes EVERY target read-only, so executing can
-    // never be authorized there — the one denial this guard can prove on its own.
-    if (!entry.unconfigured && entry.observe && toolName === 'nt_exec') {
-      return `NyaTerm nt_exec is denied: workspace "${cwd ?? '(unknown)'}" is read-only. Sessions may be opened and read, but no command may run.`
+    // An observe-only workspace makes EVERY target read-only, so execution,
+    // interruption and SFTP writes can never be authorized there — the one
+    // denial this synchronous guard can prove on its own.
+    if (!entry.unconfigured && entry.observe && NT_WRITE_TOOLS.has(toolName)) {
+      return `NyaTerm ${toolName} is denied: workspace "${cwd ?? '(unknown)'}" is read-only. Sessions and files may be read, but nothing may be executed, started, stopped or written.`
     }
     if (toolName === 'nt_open') {
       const id = String(exec?.arguments?.connectionId ?? '')

@@ -20,7 +20,7 @@
 
 ## 安装
 
-需要 **NyaTerm（正式版）**，并在 NyaTerm 里打开 **设置 → External MCP**；DSH 侧建议 0.2.1 及以上。
+需要 **NyaTerm 2.0.x（正式版）**，并在 NyaTerm 里打开 **设置 → External MCP**；DSH 侧建议 0.2.1 及以上。
 
 - **插件市场**（`dshmarket`）：在 DSH 的 **插件 → 插件市场** 里搜索 `nyaterm-bridge`，一键安装。
 - **从 GitHub 源码**：DSH 插件页 → **添加插件** → **安装第三方插件**，填 `github:visualcjy/nyaterm-bridge`；或
@@ -40,21 +40,56 @@ NyaTerm 自带 `nyaterm-mcp` 桥接。若用通用的 `@deepseek-ai/dsh-mcp-clie
 
 ## 工具
 
+**会话与命令**
+
 | 工具 | 作用 | 读/写 |
 |---|---|---|
 | `nt_connections` | 列出 NyaTerm 已保存连接与**分组路径** | 只读 |
 | `nt_workspace` | 解释当前工作区的 allowlist 判定结果 | 只读 |
-| `nt_sessions` | 列出当前作用域内的 NyaTerm 会话与默认会话 | 只读 |
-| `nt_status` | 诊断桥接/发现文件/权限模式/工具清单 | 只读 |
-| `nt_open` | 从已保存连接**打开一个真实 NyaTerm 标签页** | 写入 |
-| `nt_exec` | 在指定会话里执行命令 | 写入 |
+| `nt_sessions` | 列出会话、默认会话、所属连接（`sourceConnectionId`）与终端状态 | 只读 |
+| `nt_status` | 诊断桥接/发现文件/权限模式/NyaTerm 版本/工具清单 | 只读 |
+| `nt_open` | 从已保存连接**打开一个真实 NyaTerm 标签页**，可 `reuse_or_create` 复用已有标签页 | 写入 |
+| `nt_exec` | 在指定会话里**同步**执行命令并返回输出 | 写入 |
 | `nt_output` | 读取该会话最近的、已去 ANSI 的输出 | 只读 |
 
-典型流程：`nt_connections` → `nt_open` → `nt_exec` → `nt_output`。
+**异步任务（NyaTerm 2.0.x）**
+
+| 工具 | 作用 | 读/写 |
+|---|---|---|
+| `nt_job_start` | 起一个后台任务：`connectionId` 走独立 `ssh_exec` 通道（无需开 tab、超时最长 24h），`sessionId` 走现有终端 | 写入 |
+| `nt_job_poll` | 增量读取任务输出与状态（插件记住 offset，`eof` 不代表结束） | 只读 |
+| `nt_job_stop` | 中断任务（`accepted` 不等于已退出，需再 poll 确认） | 写入 |
+
+**远端文件（SFTP，NyaTerm 2.0.x）**
+
+| 工具 | 作用 | 读/写 |
+|---|---|---|
+| `nt_fs_home` | 远端 home 目录 | 只读 |
+| `nt_fs_list` | 列目录（类型/权限/属主/大小/时间） | 只读 |
+| `nt_fs_stat` | 路径元数据 | 只读 |
+| `nt_fs_read` | 读文本文件（单次上限 64 KiB，NyaTerm 不会截断超过上限的文件） | 只读 |
+| `nt_fs_write` | 写文本文件（上限 1 MiB），支持 `expectedHash` / `expectedMtime` / `expectedSize` / `force` 冲突保护 | 写入 |
+| `nt_fs_mkdir` / `nt_fs_rename` | 建目录 / 改名或移动 | 写入 |
+| `nt_fs_delete` | 删除文件或目录（**必须 `confirm=true`**） | 写入 |
+| `nt_fs_chmod` | 改权限 | 写入 |
+
+**大结果分页**
+
+| 工具 | 作用 | 读/写 |
+|---|---|---|
+| `nt_output_read` | 按 `outputId` + `offset` 续读 NyaTerm 包装过的超大结果 | 只读 |
+
+所有 `nt_fs_*` 与 `nt_job_start` 都接受 `sessionId`（已打开会话）或 `connectionId`（已保存连接，NyaTerm 走独立 `ssh_exec` 通道，不需要开 tab），二选一。
+
+典型流程：
+
+- 同步执行：`nt_connections` → `nt_open` → `nt_exec` → `nt_output`
+- 长任务：`nt_job_start`（`connectionId`）→ 反复 `nt_job_poll` → 需要时 `nt_job_stop`
+- 改远端文件：`nt_fs_read` → 修改 → `nt_fs_write`（带 `expectedHash`）→ 需要时 `nt_fs_stat` 复核
 
 ## 前置条件
 
-1. **NyaTerm → 设置 → 打开 External MCP**。插件靠 NyaTerm 写出的发现文档连接：
+1. **NyaTerm 2.0.x（正式版）→ 设置 → 打开 External MCP**。`nt_job_*` 与 `nt_fs_*` 需要 2.0.x 提供的 `terminal_start` / `sftp_*`；更老的 NyaTerm 上它们会失败，`nt_status` 会列出缺失的工具。插件靠 NyaTerm 写出的发现文档连接：
    - `~/.nyaterm-preview/mcp/discovery.json`（NyaTerm Preview）
    - `~/.nyaterm/mcp/discovery.json`（NyaTerm 正式版）
    - 也接受环境变量 `NYATERM_MCP_DISCOVERY` 或配置项 `discoveryFile`。
@@ -184,8 +219,25 @@ allowlist 的读写操作一律走**工具体内已 await 的校验**做主判�
 
 - **NyaTerm 的 MCP 不返回主机明细**（host/port/username 被刻意隐藏）。所以 allowlist 只能按分组路径、连接 id、连接名称来写。
 - **NyaTerm 的 MCP 没有关闭会话的工具**，`nt_open` 开出来的标签页需要你手动关闭。
-- **`nt_exec` 必须带 `sessionId`**（allowlist 生效时）。不带 sessionId 就无法判断目标连接，插件会拒绝——这是刻意的。
-- **NyaTerm 的 MCP 命令是带外执行的**：命令不会出现在终端标签页里（其审计日志记为 `insertedToTerminal: false`），且**每次 `nt_exec` 都是新 shell**（cwd/变量不延续）。想看命令在终端里跑，只能用 NyaTerm 自带的 AI 命令卡片。
+- **allowlist 生效时，`nt_exec` / `nt_job_start` / `nt_fs_*` 必须给出目标**：`sessionId`（已打开会话）或 `connectionId`（已保存 SSH 连接）。不给就无法判断目标连接，插件会拒绝——这是刻意的。
+- **NyaTerm 2.0.x 的会话是 `send_only`**：命令进入现有标签页，cwd / 环境变量在多次调用间延续；如果标签页里正跑着全屏程序，`nt_exec` 会超时且没有输出。长任务请用 `nt_job_start` + `connectionId`（独立 `ssh_exec` 通道，不碰标签页）。
+- **中断内联终端里的任务**：`nt_job_stop` 会对 `inline_pty` 任务发中断，NyaTerm 可能把该终端标记为需要恢复（`recovery_required`），需要你在 NyaTerm 的标签页菜单里确认恢复后才能继续在那个会话执行。
+- **SFTP 需要目标支持 SFTP**（SSH/SFTP 连接）。本地终端、串口连接用 `connectionId` 会被拒绝，请改用 `sessionId` 或换 SSH 连接；NyaTerm 侧也可能回 `permission_denied`。
 - **组规则只能由工具主体校验**，守卫只认显式 connectionId。也就是说 `nt_open` 的越权拦截以主体为准。
+- **`jobId` / `outputId` 只在本次插件进程内有效**：插件重启后不再认领旧 id（无法再向 allowlist 证明它属于哪个连接），需要重新 `nt_job_start`。
 - NyaTerm 重启后端口和 token 会变，插件会重新读发现文档并重连（同一路径下自动完成）。
-- `sftp_*` 工具**没有暴露**：文件操作继续交给 dsh-remote 的 `rw_*`，避免两套文件通道打架。
+
+## 更新记录
+
+### 0.2.0
+
+- 补齐 NyaTerm MCP 2.0.x 的全部工具面：
+  - 异步任务：`nt_job_start` / `nt_job_poll` / `nt_job_stop`（`connectionId` 走 `ssh_exec`，`sessionId` 走 `inline_pty`）。
+  - 远端文件：`nt_fs_home` / `nt_fs_list` / `nt_fs_stat` / `nt_fs_read` / `nt_fs_write` / `nt_fs_mkdir` / `nt_fs_rename` / `nt_fs_delete` / `nt_fs_chmod`。
+  - 大结果分页：`nt_output_read`；`nt_output` 会自动解开 `outputId` 包装。
+- `isError` 不再被忽略：NyaTerm 的 `{code, message}` 一律转成工具错误（`scope_denied` / `permission_denied` / `conflict` / `execution_failed` 等），`nt_open` 不会再在失败时报"已打开"。
+- `resolveSession` 优先使用 NyaTerm 的 `sourceConnectionId`，用户手动打开的标签页也能精确校验；会话名匹配只作旧版本兜底。
+- `nt_open` 支持 `mode=reuse_or_create` 与 `idempotencyKey`；`nt_exec` 支持 `idempotencyKey`。
+- `nt_status` 增加 NyaTerm 版本、必需/可选工具清单，并修正了"命令不在标签页显示"的过期说明。
+- `nt_sessions` 显示 `sourceConnectionId`、终端状态与任务状态。
+- 安全约束：`jobId` / `outputId` 必须由插件自己签发并映射回允许的连接，未认领的 id 一律拒绝；`nt_fs_delete` 需 `confirm=true`；只读工作区会拦下所有任务与 SFTP 写操作。
