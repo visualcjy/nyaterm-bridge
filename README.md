@@ -56,7 +56,7 @@ NyaTerm 自带 `nyaterm-mcp` 桥接。若用通用的 `@deepseek-ai/dsh-mcp-clie
 
 | 工具 | 作用 | 读/写 |
 |---|---|---|
-| `nt_job_start` | 起一个后台任务：`connectionId` 走独立 `ssh_exec` 通道（无需开 tab、超时最长 24h），`sessionId` 走现有终端 | 写入 |
+| `nt_job_start` | 起一个后台任务：`connectionId` 走独立 `ssh_exec` 通道（无需开 tab、超时最长 24h），`sessionId` 走现有终端；NyaTerm 2.0.6 起支持 `waitMs`（默认 ssh_exec 等 15s、inline 不等），等待结果会直接带回首批输出 | 写入 |
 | `nt_job_poll` | 增量读取任务输出与状态（插件记住 offset，`eof` 不代表结束） | 只读 |
 | `nt_job_stop` | 中断任务（`accepted` 不等于已退出，需再 poll 确认） | 写入 |
 
@@ -221,6 +221,7 @@ allowlist 的读写操作一律走**工具体内已 await 的校验**做主判�
 - **NyaTerm 的 MCP 没有关闭会话的工具**，`nt_open` 开出来的标签页需要你手动关闭。
 - **allowlist 生效时，`nt_exec` / `nt_job_start` / `nt_fs_*` 必须给出目标**：`sessionId`（已打开会话）或 `connectionId`（已保存 SSH 连接）。不给就无法判断目标连接，插件会拒绝——这是刻意的。
 - **NyaTerm 2.0.x 的会话是 `send_only`**：命令进入现有标签页，cwd / 环境变量在多次调用间延续；如果标签页里正跑着全屏程序，`nt_exec` 会超时且没有输出。长任务请用 `nt_job_start` + `connectionId`（独立 `ssh_exec` 通道，不碰标签页）。
+- **NyaTerm 的公共 MCP 执行模式设置会覆盖默认 backend**：NyaTerm 2.0.6 起，执行方式设为“后台”时 `nt_exec` 改走 SSH exec，**不再继承交互 shell 的 cwd/环境**；`nt_job_start` 也可以用 `waitMs`（0–30000，0 立即返回）控制等待首批输出的时长，实际 backend 以返回值为准。
 - **中断内联终端里的任务**：`nt_job_stop` 会对 `inline_pty` 任务发中断，NyaTerm 可能把该终端标记为需要恢复（`recovery_required`），需要你在 NyaTerm 的标签页菜单里确认恢复后才能继续在那个会话执行。
 - **SFTP 需要目标支持 SFTP**（SSH/SFTP 连接）。本地终端、串口连接用 `connectionId` 会被拒绝，请改用 `sessionId` 或换 SSH 连接；NyaTerm 侧也可能回 `permission_denied`。
 - **组规则只能由工具主体校验**，守卫只认显式 connectionId。也就是说 `nt_open` 的越权拦截以主体为准。
@@ -228,6 +229,15 @@ allowlist 的读写操作一律走**工具体内已 await 的校验**做主判�
 - NyaTerm 重启后端口和 token 会变，插件会重新读发现文档并重连（同一路径下自动完成）。
 
 ## 更新记录
+
+### 0.3.0
+
+- 适配 NyaTerm MCP 2.0.6：
+  - `nt_job_start` 支持 `waitMs`（0–30000，仅 2.0.6+ 会转发；老版本会明确报错），并把“等待型”返回里的首批输出直接呈现给模型，同时把 offset 记到 `nextOffset`，后续 `nt_job_poll` 不会重复。
+  - `nt_job_start` 的说明更新：NyaTerm 的执行模式设置可能强制 inline/背景，实际 backend 以返回值 `backend` 为准。
+  - `nt_exec` 的说明补充：执行模式设为“后台”时走 SSH exec，不继承交互 shell 的 cwd/环境。
+  - `nt_status` 增加 `waitMs` 能力与执行模式说明；`terminal_start` 首次 `tools/list` 即为 19 个工具（2.0.6 修复了此前首次 16 个的怪癖）。
+- 版本对齐：插件 0.3.0 仍兼容 NyaTerm 2.0.5（不传 `waitMs` 时行为不变）。
 
 ### 0.2.0
 

@@ -315,6 +315,7 @@ class NyaTermMcpClient {
   #bridge
   #discoveryFile
   #server
+  #tools = []
   #pending = new Map()
   #nextId = 1
   #buffer = ''
@@ -363,7 +364,7 @@ class NyaTermMcpClient {
       this.#request('initialize', {
         protocolVersion: '2026-07-28',
         capabilities: {},
-        clientInfo: { name: 'nyaterm-bridge', version: '0.2.0' },
+        clientInfo: { name: 'nyaterm-bridge', version: '0.3.0' },
       }).then((result) => {
         this.#server = result?.serverInfo
         // The initialized notification is fire-and-forget by protocol design.
@@ -441,7 +442,14 @@ class NyaTermMcpClient {
   async listTools() {
     await this.#ensureReady()
     const result = await this.#request('tools/list', {})
-    return Array.isArray(result?.tools) ? result.tools : []
+    const tools = Array.isArray(result?.tools) ? result.tools : []
+    this.#tools = tools
+    return tools
+  }
+
+  /** Schemas from the last {@link listTools} call, for capability checks. */
+  knownTools() {
+    return this.#tools
   }
 
   /** `serverInfo` from the MCP handshake (name + version), once connected. */
@@ -898,6 +906,29 @@ function describeExecResult(structured, text) {
   return notes.length === 0 ? body : `${body}\n[NyaTerm: ${notes.join('; ')}]`
 }
 
+/** Statuses after which a job will produce no more output. */
+const JOB_TERMINAL_STATUSES = new Set(['completed', 'failed', 'timed_out', 'cancelled', 'disconnected'])
+
+/**
+ * Render one job payload for the model.
+ *
+ * NyaTerm 2.0.6 may answer `terminal_start` with a full poll payload when it
+ * waited (its `waitMs` budget), so the start and poll tools share this renderer.
+ */
+function describeJobState(jobId, structured, offset, nextOffset, heading, emptyNote) {
+  const status = structured?.status ?? 'unknown'
+  const state = structured?.processState ?? 'unknown'
+  const exit = structured?.exitCode === undefined || structured?.exitCode === null ? '-' : structured.exitCode
+  const output = typeof structured?.output === 'string' ? stripTerminalControls(structured.output) : ''
+  const lines = [
+    `${heading.length > 0 ? `${heading} ` : ''}job ${jobId}: status=${status} process=${state} exitCode=${exit} offset=${offset}->${nextOffset} totalBytes=${formatBytes(structured?.totalBytes)}`,
+  ]
+  if (structured?.sourceTruncated === true) lines.push('(NyaTerm truncated this chunk)')
+  if (structured?.droppedBeforeOffset === true) lines.push('(earlier output was dropped by NyaTerm before this offset)')
+  lines.push(output.length > 0 ? output : emptyNote)
+  return lines.join('\n')
+}
+
 /** Build a tool definition without importing `defineTool` (kept self-contained). */
 function textOutput(render) {
   return { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: render(value) }] }
@@ -975,6 +1006,19 @@ export function apply(ctx, rawConfig) {
   let clientIdentity
   /** In-flight connect attempt, so concurrent callers share ONE bridge process. */
   let connecting
+  /**
+   * What this bridge's advertised schemas say, beyond the tool names.
+   *
+   * NyaTerm 2.0.6 added `terminal_start.waitMs` and may then answer a start with
+   * a full poll payload (output included). Older bridges reject that field
+   * outright, so the parameter is only forwarded when the schema declares it.
+   */
+  let capabilities = { waitMs: false }
+
+  /** Derive the optional-capability flags from one tool list. */
+  const inspectCapabilities = (tools) => ({
+    waitMs: tools.some((tool) => tool?.name === 'terminal_start' && tool?.inputSchema?.properties?.waitMs !== undefined),
+  })
 
   const readStore = () => loadStore(storeFile)
 
@@ -1045,7 +1089,7 @@ export function apply(ctx, rawConfig) {
       client = fresh
       clientIdentity = identity
       try {
-        await fresh.listTools()
+        capabilities = inspectCapabilities(await fresh.listTools())
       } catch (error) {
         fresh.dispose()
         if (client === fresh) {
@@ -1065,6 +1109,7 @@ export function apply(ctx, rawConfig) {
     client?.dispose()
     client = undefined
     clientIdentity = undefined
+    capabilities = { waitMs: false }
   }
 
   ctx.effect(() => releaseClient)
@@ -1561,7 +1606,7 @@ export function apply(ctx, rawConfig) {
   /** nt_exec — run a command inside an allowlisted NyaTerm session. */
   register({
     name: 'nt_exec',
-    description: 'Execute a command in an existing NyaTerm session and return its captured output. The command is typed into the session that already exists, so its working directory, exported variables and other shell state persist between calls — do not assume a fresh login, and re-establish anything you depend on. Commands run non-interactively: never start something that waits on stdin (password prompt, pager, package manager without -y, ssh without -o BatchMode=yes) — it blocks until the timeout, and a full-screen program already running in the tab makes the call time out with no output. For anything long-running, or when the tab may be busy, prefer nt_job_start with a connectionId (independent ssh_exec channel, longer timeout, pollable and interruptible). Do not run irreversible operations (format, erase config, reboot, rm -rf) unless the user explicitly asked for them; NyaTerm applies its own approval policy. A target marked read-only in the workspace allowlist is refused here — open it and read its output instead. Pass sessionId from nt_open or nt_sessions. A CLI network device (H3C/Huawei Comware, Cisco IOS) has no shell: send its CLI commands, and because paged output hangs until the timeout, put `screen-length disable` (Comware) on its own line first — or `terminal length 0` on IOS — in the SAME command, e.g. "screen-length disable\\ndisplay interface brief".',
+    description: 'Execute a command in an existing NyaTerm session and return its captured output. The command targets the session that already exists, so in NyaTerm\'s automatic/inline execution modes its working directory, exported variables and other shell state persist between calls — do not assume a fresh login, and re-establish anything you depend on; in NyaTerm\'s background execution mode this runs over SSH exec instead, without inheriting the interactive shell. Commands run non-interactively: never start something that waits on stdin (password prompt, pager, package manager without -y, ssh without -o BatchMode=yes) — it blocks until the timeout, and a full-screen program already running in the tab makes the call time out with no output. For anything long-running, or when the tab may be busy, prefer nt_job_start with a connectionId (independent ssh_exec channel, longer timeout, pollable and interruptible). Do not run irreversible operations (format, erase config, reboot, rm -rf) unless the user explicitly asked for them; NyaTerm applies its own approval policy. A target marked read-only in the workspace allowlist is refused here — open it and read its output instead. Pass sessionId from nt_open or nt_sessions. A CLI network device (H3C/Huawei Comware, Cisco IOS) has no shell: send its CLI commands, and because paged output hangs until the timeout, put `screen-length disable` (Comware) on its own line first — or `terminal length 0` on IOS — in the SAME command, e.g. "screen-length disable\\ndisplay interface brief".',
     parameters: objectSchema({
       command: { type: 'string', required: true, description: 'Shell command to type into the session.' },
       sessionId: { type: 'string', description: 'Target NyaTerm session id. Omit to use the default session.' },
@@ -1601,11 +1646,12 @@ export function apply(ctx, rawConfig) {
   /** nt_job_start — start a long-running command as a NyaTerm job. */
   register({
     name: 'nt_job_start',
-    description: 'Start a command as an asynchronous NyaTerm job and return a jobId. Unlike nt_exec, the call returns immediately and the job keeps running while you poll it with nt_job_poll and interrupt it with nt_job_stop. With connectionId the command runs on NyaTerm\'s independent ssh_exec channel (no tab needed, timeout up to 86400000 ms, and a busy tab cannot break it). With sessionId it runs inside that existing session (inline_pty). Use idempotencyKey so a retry does not start the command twice. The target connection must pass the workspace allowlist; a read-only target may start no job.',
+    description: 'Start a command as an asynchronous NyaTerm job and return a jobId. With connectionId the command runs on a saved SSH connection over the independent ssh_exec channel (no tab needed, a busy tab cannot break it, timeout up to 86400000 ms). With sessionId it runs inside that existing session (inline_pty). NyaTerm 2.0.6+ also waits up to waitMs before answering: ssh_exec jobs default to 15000 ms and inline jobs to 0, and the answer then already carries the first output, whose offset the plugin records so nt_job_poll continues from there. A job still running comes back with status=running and you keep polling with nt_job_poll; interrupt it with nt_job_stop. NyaTerm\'s public MCP execution setting can force inline or background execution, so the reported backend may differ from the target default. Use idempotencyKey so a retry does not start the command twice. The target connection must pass the workspace allowlist; a read-only target may start no job.',
     parameters: objectSchema({
       command: { type: 'string', required: true, description: 'Command to run. It does not inherit an interactive shell\'s cwd or environment on the ssh_exec channel.' },
-      connectionId: { type: 'string', description: 'Saved connection to run on (ssh_exec, independent channel). Pass this or sessionId, not both.' },
+      connectionId: { type: 'string', description: 'Saved SSH connection to run on (ssh_exec, independent channel). Pass this or sessionId, not both.' },
       sessionId: { type: 'string', description: 'Open session to run inside (inline_pty). Pass this or connectionId, not both.' },
+      waitMs: { type: 'integer', description: 'Optional milliseconds to wait for first output before answering, 0–30000 (NyaTerm 2.0.6+; the bridge caps it). 0 returns immediately; omit it for NyaTerm\'s default: 15000 on ssh_exec, 0 on inline_pty.' },
       timeoutMs: { type: 'integer', description: 'Optional job timeout in milliseconds (NyaTerm allows 1000–86400000).' },
       idempotencyKey: { type: 'string', description: 'Optional key that makes a retried start return the same job instead of starting another.' },
     }),
@@ -1641,11 +1687,20 @@ export function apply(ctx, rawConfig) {
         connection = authorized?.connection
         payload = { target: { type: 'session', sessionId: String(sessionId) }, backend: 'inline_pty' }
       }
+      if (args.waitMs !== undefined) {
+        if (!Number.isInteger(args.waitMs) || args.waitMs < 0) {
+          throw new Error('waitMs must be a non-negative integer (NyaTerm caps it at 30000).')
+        }
+        if (!capabilities.waitMs) {
+          throw new Error('This NyaTerm bridge does not advertise terminal_start.waitMs (added in NyaTerm 2.0.6), so it would reject the field. Omit waitMs or upgrade NyaTerm; nt_job_poll still works without it.')
+        }
+      }
       // With the allowlist off, an omitted target is passed straight through and
       // NyaTerm starts the job in its active/default session.
       const { structured } = await callNyaTermStrict('terminal_start', {
         command: args.command,
         ...payload,
+        ...(args.waitMs === undefined ? {} : { waitMs: args.waitMs }),
         ...(args.timeoutMs === undefined ? {} : { timeoutMs: args.timeoutMs }),
         ...(args.idempotencyKey === undefined ? {} : { idempotencyKey: args.idempotencyKey }),
       })
@@ -1653,14 +1708,24 @@ export function apply(ctx, rawConfig) {
       if (typeof jobId !== 'string' || jobId.length === 0) {
         throw new Error(`NyaTerm terminal_start returned no jobId (raw: ${JSON.stringify(structured)?.slice(0, 300) ?? '(none)'}).`)
       }
+      // A waited start (NyaTerm 2.0.6) answers with a poll payload, output
+      // included; without the wait it answers with just the job header.
+      const waited = typeof structured?.nextOffset === 'number'
       const record = {
         connectionId: connection?.id === undefined ? undefined : String(connection.id),
         sessionId: typeof structured?.sessionId === 'string' ? structured.sessionId : sessionId,
         backend: structured?.backend ?? payload.backend,
-        offset: 0,
+        offset: waited ? structured.nextOffset : 0,
       }
       rememberJob(jobId, record)
-      return `Started job ${jobId} (backend=${record.backend}, status=${structured?.status ?? 'unknown'}).\nPoll it with nt_job_poll jobId=${jobId}; interrupt it with nt_job_stop.`
+      if (!waited) {
+        return `Started job ${jobId} (backend=${record.backend}, status=${structured?.status ?? 'unknown'}).\nPoll it with nt_job_poll jobId=${jobId}; interrupt it with nt_job_stop.`
+      }
+      const lines = [describeJobState(jobId, structured, 0, record.offset, 'Started', '(no output captured yet)')]
+      if (!JOB_TERMINAL_STATUSES.has(String(structured?.status ?? ''))) {
+        lines.push(`The job is still running; continue with nt_job_poll jobId=${jobId}, or interrupt it with nt_job_stop.`)
+      }
+      return lines.join('\n')
     },
   })
 
@@ -1685,15 +1750,7 @@ export function apply(ctx, rawConfig) {
       })
       const next = typeof structured?.nextOffset === 'number' ? structured.nextOffset : offset
       if (record !== undefined) record.offset = next
-      const output = typeof structured?.output === 'string' ? stripTerminalControls(structured.output) : ''
-      const status = structured?.status ?? 'unknown'
-      const state = structured?.processState ?? 'unknown'
-      const exit = structured?.exitCode === undefined || structured?.exitCode === null ? '-' : structured.exitCode
-      const lines = [`job ${jobId}: status=${status} process=${state} exitCode=${exit} offset=${offset}->${next} totalBytes=${formatBytes(structured?.totalBytes)}`]
-      if (structured?.sourceTruncated === true) lines.push('(NyaTerm truncated this chunk)')
-      if (structured?.droppedBeforeOffset === true) lines.push('(earlier output was dropped by NyaTerm before this offset)')
-      lines.push(output.length > 0 ? output : '(no new output since the last poll)')
-      return lines.join('\n')
+      return describeJobState(jobId, structured, offset, next, '', '(no new output since the last poll)')
     },
   })
 
@@ -2052,6 +2109,8 @@ export function apply(ctx, rawConfig) {
         const tools = await active.listTools()
         const server = active.serverInfo()
         lines.push(`bridge version: ${server?.name ?? 'nyaterm-mcp'} ${server?.version ?? '(unknown)'}`)
+        lines.push(`start wait budget: ${capabilities.waitMs ? 'waitMs supported (NyaTerm 2.0.6+)' : 'waitMs unavailable on this bridge; omit it (needs NyaTerm 2.0.6+)'}`)
+        lines.push('execution mode: not reported by MCP — NyaTerm\'s public MCP execution setting decides whether commands use the PTY (automatic/inline) or SSH exec (background)')
         lines.push(`tools: ${tools.map((tool) => tool.name).join(', ')}`)
         const names = new Set(tools.map((tool) => tool.name))
         const required = ['connection_list', 'get_environment', 'session_open', 'session_get', 'terminal_execute', 'terminal_recent_output']
