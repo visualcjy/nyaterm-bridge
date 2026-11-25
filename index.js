@@ -364,7 +364,7 @@ class NyaTermMcpClient {
       this.#request('initialize', {
         protocolVersion: '2026-07-28',
         capabilities: {},
-        clientInfo: { name: 'nyaterm-bridge', version: '0.3.0' },
+        clientInfo: { name: 'nyaterm-bridge', version: '0.4.0' },
       }).then((result) => {
         this.#server = result?.serverInfo
         // The initialized notification is fire-and-forget by protocol design.
@@ -921,7 +921,7 @@ function describeJobState(jobId, structured, offset, nextOffset, heading, emptyN
   const exit = structured?.exitCode === undefined || structured?.exitCode === null ? '-' : structured.exitCode
   const output = typeof structured?.output === 'string' ? stripTerminalControls(structured.output) : ''
   const lines = [
-    `${heading.length > 0 ? `${heading} ` : ''}job ${jobId}: status=${status} process=${state} exitCode=${exit} offset=${offset}->${nextOffset} totalBytes=${formatBytes(structured?.totalBytes)}`,
+    `${heading.length > 0 ? `${heading} ` : ''}job ${jobId}: backend=${structured?.backend ?? '?'} status=${status} process=${state} exitCode=${exit} offset=${offset}->${nextOffset} totalBytes=${formatBytes(structured?.totalBytes)}`,
   ]
   if (structured?.sourceTruncated === true) lines.push('(NyaTerm truncated this chunk)')
   if (structured?.droppedBeforeOffset === true) lines.push('(earlier output was dropped by NyaTerm before this offset)')
@@ -961,6 +961,13 @@ function normalizeConfig(raw) {
     discoveryFile: str(source.discoveryFile, ''),
     storeDir: str(source.storeDir, ''),
     enforceAllowlist: bool(source.enforceAllowlist, true),
+    // New calls prefer the visible/recorded tab path; 'channel' restores the
+    // isolated ssh_exec behaviour for long or unattended jobs.
+    jobMode: source.jobMode === 'channel' ? 'channel' : 'pty',
+    // When false, mode="channel" is refused outright: every job then runs in a
+    // visible tab and is eligible for recording. Operators keep an escape hatch
+    // for unattended work by leaving this true (the default).
+    allowUnrecordedJobs: bool(source.allowUnrecordedJobs, true),
     allowOtherTools: bool(source.allowOtherTools, true),
     defaultObserveOnly: bool(source.defaultObserveOnly, false),
     observeTools: Array.isArray(source.observeTools) ? source.observeTools.filter((n) => typeof n === 'string') : [],
@@ -1286,6 +1293,36 @@ export function apply(ctx, rawConfig) {
     return authorize(exec, connection, operation)
   }
 
+  /**
+   * Return a live session for a saved connection, opening its tab when needed.
+   *
+   * A bare connection id otherwise means NyaTerm's invisible ssh_exec channel:
+   * no tab, no session recording, no shell history. A tab is what makes a
+   * command visible and recordable, and NyaTerm reuses the existing tab for a
+   * connection, so `session_open`'s `reuse_or_create` mode keeps this
+   * idempotent (verified: two calls return the same sessionId).
+   */
+  const ensureSession = async (connection) => {
+    const connectionId = String(connection.id)
+    const { structured } = await callNyaTermStrict('get_environment', {})
+    const sessions = Array.isArray(structured?.sessions) ? structured.sessions : []
+    const existing = sessions.find((session) => String(session.sourceConnectionId ?? '') === connectionId && session.connected !== false)
+    if (existing !== undefined) {
+      const id = String(existing.id ?? existing.sessionId ?? '')
+      if (id.length > 0) {
+        rememberSession(id, connectionId)
+        return id
+      }
+    }
+    const opened = await callNyaTermStrict('session_open', { connectionId, mode: 'reuse_or_create' })
+    const sessionId = opened.structured?.sessionId ?? opened.structured?.session?.sessionId
+    if (sessionId === undefined) {
+      throw new Error(`NyaTerm session_open returned no sessionId for "${connection.name ?? connectionId}" (raw: ${JSON.stringify(opened.structured)?.slice(0, 300) ?? '(none)'}).`)
+    }
+    rememberSession(sessionId, connectionId)
+    return String(sessionId)
+  }
+
   // -------------------------------------------------------------------------
   // Result paging and owned ids
   //
@@ -1606,16 +1643,21 @@ export function apply(ctx, rawConfig) {
   /** nt_exec — run a command inside an allowlisted NyaTerm session. */
   register({
     name: 'nt_exec',
-    description: 'Execute a command in an existing NyaTerm session and return its captured output. The command targets the session that already exists, so in NyaTerm\'s automatic/inline execution modes its working directory, exported variables and other shell state persist between calls — do not assume a fresh login, and re-establish anything you depend on; in NyaTerm\'s background execution mode this runs over SSH exec instead, without inheriting the interactive shell. Commands run non-interactively: never start something that waits on stdin (password prompt, pager, package manager without -y, ssh without -o BatchMode=yes) — it blocks until the timeout, and a full-screen program already running in the tab makes the call time out with no output. For anything long-running, or when the tab may be busy, prefer nt_job_start with a connectionId (independent ssh_exec channel, longer timeout, pollable and interruptible). Do not run irreversible operations (format, erase config, reboot, rm -rf) unless the user explicitly asked for them; NyaTerm applies its own approval policy. A target marked read-only in the workspace allowlist is refused here — open it and read its output instead. Pass sessionId from nt_open or nt_sessions. A CLI network device (H3C/Huawei Comware, Cisco IOS) has no shell: send its CLI commands, and because paged output hangs until the timeout, put `screen-length disable` (Comware) on its own line first — or `terminal length 0` on IOS — in the SAME command, e.g. "screen-length disable\\ndisplay interface brief".',
+    description: 'Execute a command in a NyaTerm session and return its captured output. Pass sessionId for an existing session, or connectionId to run on a saved connection — the plugin then opens or reuses that connection\'s tab (NyaTerm returns the same tab for the same connection), so the command is visible in NyaTerm, eligible for session recording, and part of the shell\'s own history. State persists between calls in the same tab in NyaTerm\'s automatic/inline execution modes; in its background execution mode the command runs over SSH exec instead and inherits nothing. Commands run non-interactively: never start something that waits on stdin (password prompt, pager, package manager without -y, ssh without -o BatchMode=yes) — it blocks until the timeout, and a full-screen program already running in the tab makes the call time out with no output. For anything long-running, prefer nt_job_start; use its mode="channel" only when the user explicitly asks for an unrecorded or unattended run. Do not run irreversible operations (format, erase config, reboot, rm -rf) unless the user explicitly asked for them; NyaTerm applies its own approval policy. A target marked read-only in the workspace allowlist is refused here — open it and read its output instead. A CLI network device (H3C/Huawei Comware, Cisco IOS) has no shell: send its CLI commands, and because paged output hangs until the timeout, put `screen-length disable` (Comware) on its own line first — or `terminal length 0` on IOS — in the SAME command, e.g. "screen-length disable\\ndisplay interface brief".',
     parameters: objectSchema({
       command: { type: 'string', required: true, description: 'Shell command to type into the session.' },
-      sessionId: { type: 'string', description: 'Target NyaTerm session id. Omit to use the default session.' },
+      sessionId: { type: 'string', description: 'Existing NyaTerm session id (from nt_open or nt_sessions). Pass this or connectionId.' },
+      connectionId: { type: 'string', description: 'Saved connection id; the plugin opens or reuses its visible tab. Pass this or sessionId.' },
       timeoutMs: { type: 'integer', description: 'Optional timeout in milliseconds for the command (NyaTerm caps each call at 300000).' },
       idempotencyKey: { type: 'string', description: 'Optional key so a retried call does not run the command twice.' },
     }),
     output: textOutput((value) => value),
     async execute(args, exec) {
       const sessionId = typeof args.sessionId === 'string' && args.sessionId.length > 0 ? args.sessionId : undefined
+      const connectionId = typeof args.connectionId === 'string' && args.connectionId.length > 0 ? args.connectionId : undefined
+      if (sessionId !== undefined && connectionId !== undefined) {
+        throw new Error('Pass only one of sessionId and connectionId to nt_exec: they name different targets.')
+      }
       const run = async (target) => {
         const result = await callNyaTermStrict('terminal_execute', {
           command: args.command,
@@ -1629,14 +1671,23 @@ export function apply(ctx, rawConfig) {
         }
         return describeExecResult(unwrapped.structured, unwrapped.text)
       }
+      if (connectionId !== undefined) {
+        const { byId } = await fetchConnections()
+        const connection = byId.get(connectionId)
+        if (connection === undefined) {
+          throw new Error(`Unknown connectionId "${connectionId}". Call nt_connections for the saved ids (ids of deleted or renamed connections go stale).`)
+        }
+        await authorize(exec, connection, 'terminal_execute')
+        return run(await ensureSession(connection))
+      }
       if (sessionId === undefined) {
         if (!cfg.enforceAllowlist) return run(undefined)
         const store = readStore()
         const entry = resolveEntry(cfg, store, sessionCwd(exec))
         if (entry.unconfigured) {
-          throw new Error(`NyaTerm terminal_execute is denied: workspace "${sessionCwd(exec) ?? '(unknown)'}" is not listed in the allowlist (${storeFile}), and no sessionId was given to check. Add the workspace, or pass an allowlisted sessionId.`)
+          throw new Error(`NyaTerm terminal_execute is denied: workspace "${sessionCwd(exec) ?? '(unknown)'}" is not listed in the allowlist (${storeFile}), and no target was given to check. Add the workspace, or pass an allowlisted sessionId/connectionId.`)
         }
-        throw new Error('A sessionId is required in an allowlisted workspace: without one, the target connection cannot be checked against the allowlist. Call nt_sessions or nt_open first.')
+        throw new Error('A sessionId or connectionId is required in an allowlisted workspace: without one, the target connection cannot be checked against the allowlist. Call nt_sessions, nt_connections or nt_open first.')
       }
       await authorizeSession(exec, sessionId, 'terminal_execute')
       return run(sessionId)
@@ -1646,11 +1697,12 @@ export function apply(ctx, rawConfig) {
   /** nt_job_start — start a long-running command as a NyaTerm job. */
   register({
     name: 'nt_job_start',
-    description: 'Start a command as an asynchronous NyaTerm job and return a jobId. With connectionId the command runs on a saved SSH connection over the independent ssh_exec channel (no tab needed, a busy tab cannot break it, timeout up to 86400000 ms). With sessionId it runs inside that existing session (inline_pty). NyaTerm 2.0.6+ also waits up to waitMs before answering: ssh_exec jobs default to 15000 ms and inline jobs to 0, and the answer then already carries the first output, whose offset the plugin records so nt_job_poll continues from there. A job still running comes back with status=running and you keep polling with nt_job_poll; interrupt it with nt_job_stop. NyaTerm\'s public MCP execution setting can force inline or background execution, so the reported backend may differ from the target default. Use idempotencyKey so a retry does not start the command twice. The target connection must pass the workspace allowlist; a read-only target may start no job.',
+    description: 'Start a command as an asynchronous NyaTerm job and return a jobId. By default a connection target runs in that connection\'s visible tab (mode="pty"): the plugin opens or reuses the tab, so the job is visible and eligible for session recording, then polls through nt_job_poll and stops through nt_job_stop. mode="channel" uses NyaTerm\'s isolated ssh_exec channel instead — no tab, cannot be recorded, but immune to a busy tab. Choose channel only when the user explicitly asks for an unattended or unrecorded run; otherwise keep the default pty so the command is recorded. With sessionId the job always runs inside that existing tab (inline_pty). NyaTerm 2.0.6+ waits up to waitMs before answering (ssh_exec defaults to 15000 ms, inline to 0) and then includes the first output, whose offset the plugin records so polling continues from there; a job still running comes back with status=running. NyaTerm\'s public MCP execution setting can force inline or background execution, so the reported backend may differ from the requested mode. Use idempotencyKey so a retry does not start the command twice. The target connection must pass the workspace allowlist; a read-only target may start no job.',
     parameters: objectSchema({
-      command: { type: 'string', required: true, description: 'Command to run. It does not inherit an interactive shell\'s cwd or environment on the ssh_exec channel.' },
-      connectionId: { type: 'string', description: 'Saved SSH connection to run on (ssh_exec, independent channel). Pass this or sessionId, not both.' },
-      sessionId: { type: 'string', description: 'Open session to run inside (inline_pty). Pass this or connectionId, not both.' },
+      command: { type: 'string', required: true, description: 'Command to run. In a tab it inherits that shell\'s cwd/environment; on the ssh_exec channel it inherits neither.' },
+      connectionId: { type: 'string', description: 'Saved connection to run on. Pass this or sessionId, not both.' },
+      sessionId: { type: 'string', description: 'Open session to run inside; always inline_pty in that tab. Pass this or connectionId.' },
+      mode: { type: 'string', enum: ['pty', 'channel'], description: 'How a connection target runs: "pty" (default) opens/reuses the visible tab and is recordable; "channel" runs on the isolated ssh_exec channel and is NOT recorded — use it only when the user explicitly asked for an unattended/unrecorded run. Ignored for sessionId.' },
       waitMs: { type: 'integer', description: 'Optional milliseconds to wait for first output before answering, 0–30000 (NyaTerm 2.0.6+; the bridge caps it). 0 returns immediately; omit it for NyaTerm\'s default: 15000 on ssh_exec, 0 on inline_pty.' },
       timeoutMs: { type: 'integer', description: 'Optional job timeout in milliseconds (NyaTerm allows 1000–86400000).' },
       idempotencyKey: { type: 'string', description: 'Optional key that makes a retried start return the same job instead of starting another.' },
@@ -1659,6 +1711,13 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const connectionId = typeof args.connectionId === 'string' && args.connectionId.length > 0 ? args.connectionId : undefined
       const sessionId = typeof args.sessionId === 'string' && args.sessionId.length > 0 ? args.sessionId : undefined
+      const mode = args.mode === undefined ? cfg.jobMode : args.mode
+      if (mode !== 'pty' && mode !== 'channel') {
+        throw new Error('mode must be "pty" (visible tab, default) or "channel" (isolated ssh_exec).')
+      }
+      if (mode === 'channel' && !cfg.allowUnrecordedJobs) {
+        throw new Error('mode="channel" is disabled in this profile (allowUnrecordedJobs=false): it runs on ssh_exec and is not recorded. Use the default mode="pty" to run in the connection tab, or enable allowUnrecordedJobs in the plugin config if an unrecorded job is really intended.')
+      }
       if (connectionId !== undefined && sessionId !== undefined) {
         throw new Error('Pass only one of connectionId and sessionId to nt_job_start: they are different targets and NyaTerm refuses both at once.')
       }
@@ -1666,7 +1725,20 @@ export function apply(ctx, rawConfig) {
         // Without a target the plugin cannot prove which connection runs the
         // job, so an enforcing workspace refuses; NyaTerm's own "default
         // session" fallback is only reachable when the allowlist is off.
-        throw new Error('Pass connectionId (saved connection, ssh_exec) or sessionId (open session, inline_pty) to nt_job_start. One is required so the target can be checked against the allowlist.')
+        throw new Error('Pass connectionId (saved connection) or sessionId (open session) to nt_job_start. One is required so the target can be checked against the allowlist.')
+      }
+      if (args.waitMs !== undefined) {
+        if (!Number.isInteger(args.waitMs) || args.waitMs < 0) {
+          throw new Error('waitMs must be a non-negative integer (NyaTerm caps it at 30000).')
+        }
+        // Capabilities come from the bridge's advertised schemas, which are not
+        // known until the first connect; make sure one happened before deciding
+        // that waitMs is unsupported (otherwise the very first call in a session
+        // would wrongly reject it).
+        if (!capabilities.waitMs) await connect()
+        if (!capabilities.waitMs) {
+          throw new Error('This NyaTerm bridge does not advertise terminal_start.waitMs (added in NyaTerm 2.0.6), so it would reject the field. Omit waitMs or upgrade NyaTerm; nt_job_poll still works without it.')
+        }
       }
       let connection
       let payload = {}
@@ -1676,24 +1748,27 @@ export function apply(ctx, rawConfig) {
         if (connection === undefined) {
           throw new Error(`Unknown connectionId "${connectionId}". Call nt_connections for the saved ids (ids of deleted or renamed connections go stale).`)
         }
-        if (String(connection.type ?? '') !== 'ssh') {
-          throw new Error(`connectionId "${connectionId}" is a ${String(connection.type ?? 'non-SSH')} connection, and NyaTerm only accepts a connection target over ssh_exec. Open it with nt_open and pass its sessionId instead.`)
-        }
         const authorized = await authorize(exec, connection, 'terminal_start')
         connection = authorized.connection ?? connection
-        payload = { target: { type: 'connection', connectionId: String(connection.id) }, backend: 'ssh_exec' }
+        if (mode === 'channel') {
+          if (String(connection.type ?? '') !== 'ssh') {
+            throw new Error(`connectionId "${connectionId}" is a ${String(connection.type ?? 'non-SSH')} connection: mode="channel" needs a saved SSH connection. Use mode="pty" (the default) to run it in a tab, or open it with nt_open and pass sessionId.`)
+          }
+          payload = { target: { type: 'connection', connectionId: String(connection.id) }, backend: 'ssh_exec' }
+        } else {
+          // A pty job runs inside the connection's tab. Opening it explicitly
+          // (reuse_or_create) works on both 2.0.5 and 2.0.6, whereas a
+          // connection target with inline_pty is rejected by older bridges.
+          const opened = await ensureSession(connection)
+          payload = { target: { type: 'session', sessionId: opened }, backend: 'inline_pty' }
+        }
       } else if (sessionId !== undefined) {
+        if (mode === 'channel') {
+          throw new Error('mode="channel" needs connectionId: a job started from an existing session always runs in that tab as inline_pty.')
+        }
         const authorized = await authorizeSession(exec, sessionId, 'terminal_start')
         connection = authorized?.connection
         payload = { target: { type: 'session', sessionId: String(sessionId) }, backend: 'inline_pty' }
-      }
-      if (args.waitMs !== undefined) {
-        if (!Number.isInteger(args.waitMs) || args.waitMs < 0) {
-          throw new Error('waitMs must be a non-negative integer (NyaTerm caps it at 30000).')
-        }
-        if (!capabilities.waitMs) {
-          throw new Error('This NyaTerm bridge does not advertise terminal_start.waitMs (added in NyaTerm 2.0.6), so it would reject the field. Omit waitMs or upgrade NyaTerm; nt_job_poll still works without it.')
-        }
       }
       // With the allowlist off, an omitted target is passed straight through and
       // NyaTerm starts the job in its active/default session.
@@ -1718,10 +1793,19 @@ export function apply(ctx, rawConfig) {
         offset: waited ? structured.nextOffset : 0,
       }
       rememberJob(jobId, record)
+      const where = record.sessionId === undefined ? '' : ` tab=${record.sessionId}`
+      // A pty request can still be forced onto ssh_exec by NyaTerm's public MCP
+      // execution setting; say so, because that run is not recorded.
+      const forcedUnrecorded = mode === 'pty' && record.backend !== 'inline_pty'
+      const forcedNote = forcedUnrecorded
+        ? `\nWARNING: NyaTerm ran this on backend=${record.backend} instead of a tab, so it is NOT recorded. Check NyaTerm\'s public MCP execution setting if you expected a recorded run.`
+        : ''
       if (!waited) {
-        return `Started job ${jobId} (backend=${record.backend}, status=${structured?.status ?? 'unknown'}).\nPoll it with nt_job_poll jobId=${jobId}; interrupt it with nt_job_stop.`
+        return `Started job ${jobId} (backend=${record.backend}${where}, status=${structured?.status ?? 'unknown'}).${forcedNote}\nPoll it with nt_job_poll jobId=${jobId}; interrupt it with nt_job_stop.`
       }
       const lines = [describeJobState(jobId, structured, 0, record.offset, 'Started', '(no output captured yet)')]
+      if (where.length > 0) lines.push(`runs in tab sessionId=${record.sessionId}`)
+      if (forcedUnrecorded) lines.push(`WARNING: NyaTerm ran this on backend=${record.backend} instead of a tab, so it is NOT recorded. Check NyaTerm's public MCP execution setting if you expected a recorded run.`)
       if (!JOB_TERMINAL_STATUSES.has(String(structured?.status ?? ''))) {
         lines.push(`The job is still running; continue with nt_job_poll jobId=${jobId}, or interrupt it with nt_job_stop.`)
       }
@@ -2111,6 +2195,8 @@ export function apply(ctx, rawConfig) {
         lines.push(`bridge version: ${server?.name ?? 'nyaterm-mcp'} ${server?.version ?? '(unknown)'}`)
         lines.push(`start wait budget: ${capabilities.waitMs ? 'waitMs supported (NyaTerm 2.0.6+)' : 'waitMs unavailable on this bridge; omit it (needs NyaTerm 2.0.6+)'}`)
         lines.push('execution mode: not reported by MCP — NyaTerm\'s public MCP execution setting decides whether commands use the PTY (automatic/inline) or SSH exec (background)')
+        lines.push(`job execution: ${cfg.jobMode} (${cfg.jobMode === 'pty' ? 'connection jobs run in that connection\'s tab — visible and eligible for session recording' : 'connection jobs run on the isolated ssh_exec channel — no tab, not recordable'}); nt_job_start mode= overrides per call`)
+        lines.push(`unrecorded jobs: ${cfg.allowUnrecordedJobs ? 'allowed (mode="channel" is available)' : 'blocked (mode="channel" is refused; only recorded tab runs)'}`)
         lines.push(`tools: ${tools.map((tool) => tool.name).join(', ')}`)
         const names = new Set(tools.map((tool) => tool.name))
         const required = ['connection_list', 'get_environment', 'session_open', 'session_get', 'terminal_execute', 'terminal_recent_output']

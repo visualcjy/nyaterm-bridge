@@ -11,6 +11,20 @@
         enabled: true
         enforceAllowlist: true
         defaultObserveOnly: false
+        # Execution path for connection-targeted calls (0.4.0+):
+        #   pty     (default) open or reuse the connection's visible NyaTerm tab,
+        #           so the command is visible and eligible for session recording.
+        #   channel run jobs on NyaTerm's isolated ssh_exec channel: no tab, not
+        #           recordable, but immune to a busy tab and good for unattended
+        #           long jobs.
+        # `nt_job_start`'s per-call `mode` overrides this, and `nt_exec` with a
+        # connectionId always uses the tab path (it has no channel variant).
+        # jobMode: pty
+        #
+        # Set false to forbid `mode="channel"` entirely: every job then runs in a
+        # visible tab and is eligible for recording. Keep true (default) only if
+        # unattended, explicitly unrecorded jobs are acceptable.
+        # allowUnrecordedJobs: false
         # GLOBAL settings + allowlist location. It governs every workspace this
         # Harness serves, so it deliberately lives outside any one workspace (and
         # outside the process working directory, which changes between launches).

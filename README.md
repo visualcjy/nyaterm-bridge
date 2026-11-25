@@ -49,14 +49,14 @@ NyaTerm 自带 `nyaterm-mcp` 桥接。若用通用的 `@deepseek-ai/dsh-mcp-clie
 | `nt_sessions` | 列出会话、默认会话、所属连接（`sourceConnectionId`）与终端状态 | 只读 |
 | `nt_status` | 诊断桥接/发现文件/权限模式/NyaTerm 版本/工具清单 | 只读 |
 | `nt_open` | 从已保存连接**打开一个真实 NyaTerm 标签页**，可 `reuse_or_create` 复用已有标签页 | 写入 |
-| `nt_exec` | 在指定会话里**同步**执行命令并返回输出 | 写入 |
+| `nt_exec` | **同步**执行命令并返回输出；给 `sessionId` 走现有会话，给 `connectionId` 则自动打开/复用该连接的可见标签页再执行 | 写入 |
 | `nt_output` | 读取该会话最近的、已去 ANSI 的输出 | 只读 |
 
 **异步任务（NyaTerm 2.0.x）**
 
 | 工具 | 作用 | 读/写 |
 |---|---|---|
-| `nt_job_start` | 起一个后台任务：`connectionId` 走独立 `ssh_exec` 通道（无需开 tab、超时最长 24h），`sessionId` 走现有终端；NyaTerm 2.0.6 起支持 `waitMs`（默认 ssh_exec 等 15s、inline 不等），等待结果会直接带回首批输出 | 写入 |
+| `nt_job_start` | 起一个后台任务：`connectionId` 默认 `mode="pty"` 在该连接的**可见标签页**里跑（可被录制），`mode="channel"` 走隔离的 `ssh_exec` 通道（无 tab、不录制、抗忙标签页）；`sessionId` 走现有终端。NyaTerm 2.0.6 起支持 `waitMs`（默认 ssh_exec 等 15s、inline 不等），等待结果会直接带回首批输出 | 写入 |
 | `nt_job_poll` | 增量读取任务输出与状态（插件记住 offset，`eof` 不代表结束） | 只读 |
 | `nt_job_stop` | 中断任务（`accepted` 不等于已退出，需再 poll 确认） | 写入 |
 
@@ -215,6 +215,14 @@ allowlist 的读写操作一律走**工具体内已 await 的校验**做主判�
 # bridgeExecutable: /usr/bin/nyaterm-mcp
 ```
 
+## 可见性与录制
+
+- **默认走标签页**：`nt_exec connectionId` 与 `nt_job_start connectionId`（`mode="pty"`）都会先打开/复用该连接的标签页，命令在真实终端里执行——看得见、会进入该 shell 自己的历史、也才有资格被 NyaTerm 的会话录制捕获。同一连接只保留一个标签页（NyaTerm 按连接复用）。
+- **隔离通道**：`nt_job_start mode="channel"` 用 NyaTerm 的 `ssh_exec` 通道，不占标签页、不受"标签页里跑着全屏程序"影响，适合长时间无人值守任务；代价是**没有标签页、不会被会话录制**，也不继承交互 shell 的环境。把插件配置 `allowUnrecordedJobs` 设为 `false` 可以直接禁掉这条通道，让所有任务都只能走可录制的标签页。
+- **默认策略**：连接目标默认 `mode="pty"`（标签页、可录制）；`mode="channel"` 只在**用户明确要求“无人值守 / 不录制”**时使用，工具描述里已写明。插件配置 `allowUnrecordedJobs` 默认 `true`；如需彻底禁掉这条通道，把它设为 `false`。
+- **录制由 NyaTerm 的「自动录制新会话」开关决定**：标签页是前提；开关打开时（本机当前开启，`recording.auto_start: true`，保存到 `/Users/apple/Documents/Logs`），标签页里的命令会以 `[INPUT]` / `[OUTPUT]` 加时间戳落盘；`ssh_exec` 通道无论开关如何都不会有录制文件。
+- **标签页会被复用**：`session_open` 用 `reuse_or_create`，同一连接重复调用不会堆出多个 tab；NyaTerm MCP 没有关闭会话的工具，标签页需要手动关闭。
+
 ## 已知限制
 
 - **NyaTerm 的 MCP 不返回主机明细**（host/port/username 被刻意隐藏）。所以 allowlist 只能按分组路径、连接 id、连接名称来写。
@@ -229,6 +237,16 @@ allowlist 的读写操作一律走**工具体内已 await 的校验**做主判�
 - NyaTerm 重启后端口和 token 会变，插件会重新读发现文档并重连（同一路径下自动完成）。
 
 ## 更新记录
+
+### 0.4.0
+
+- **执行路径改为“可见优先”**：
+  - `nt_exec` 新增 `connectionId`：插件自动打开/复用该连接的标签页再执行，等价于 `nt_open` + `nt_exec`，不再需要模型先手动开会话。
+  - `nt_job_start` 新增 `mode`（`pty` 默认 / `channel`）；连接目标默认在可见标签页里跑，`mode="channel"` 仍保留隔离的 `ssh_exec` 通道。插件配置新增 `jobMode`（默认 `pty`），可整体切回 `channel`。
+  - 同一连接只复用同一个标签页（实测 `session_open reuse_or_create` 幂等）。
+- `nt_status` 增加 `job execution` / `unrecorded jobs` 两行，说明当前策略与可录制性；`nt_job_start` 结果首行带 `backend=`，pty 还会带 `runs in tab sessionId=…`，被强制成 ssh_exec 时输出 WARNING。
+- 策略：默认 pty；`mode="channel"` 仅限用户明确要求“无人值守 / 不录制”时使用（工具描述已写明），`allowUnrecordedJobs` 默认 `true`（可硬禁）。
+- 文档补充“录制由 NyaTerm 的「自动录制新会话」开关决定；`ssh_exec` 通道永远没有录制文件”的说明（本机已开启，实测 pty 命令落盘、channel 命令不落盘）。
 
 ### 0.3.0
 

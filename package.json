@@ -1,6 +1,6 @@
 {
   "name": "nyaterm-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Run AI commands in NyaTerm terminal sessions, reuse saved connections and jump hosts, run long tasks as pollable jobs, edit remote files over SFTP, and gate everything by a per-workspace allowlist. Commands and calls are recorded in NyaTerm. The allowlist and the NyaTerm MCP helper location are edited in Settings → NyaTerm 白名单.",
   "license": "MIT",
   "author": "visualcjy",
